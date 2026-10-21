@@ -601,7 +601,7 @@ namespace RagdollSandbox
     #endregion
 
     #region Registry and events
-    public enum DamageType { Blunt, Cut, Pierce, Blast, Crush, Shock, Fall }
+    public enum DamageType { Blunt, Cut, Pierce, Blast, Crush, Shock, Fall, Burn }
 
     public struct DamageInfo
     {
@@ -724,7 +724,13 @@ namespace RagdollSandbox
         public static void RaiseOrganDestroyed(RagdollBody b, OrganType o) { var h = OrganDestroyed; if (h != null) h(b, o); }
         public static void RaiseExplosion(Vector3 p, float r) { var h = Explosion; if (h != null) h(p, r); }
         public static void RaiseToast(string text, Color c) { var h = Toast; if (h != null) h(text, c); }
-        public static void RaiseKill(string who, string what, Color c) { var h = Kill; if (h != null) h(who, what, c); }
+        /// <summary>Set while the network delivers the host's kill-feed entries (clients ignore their own replays).</summary>
+        public static bool NetDelivery;
+        public static void RaiseKill(string who, string what, Color c)
+        {
+            if (Sandbox.IsClient && !NetDelivery) return;
+            var h = Kill; if (h != null) h(who, what, c);
+        }
 
         public static void ClearAll()
         {

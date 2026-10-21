@@ -28,6 +28,7 @@ namespace RagdollSandbox
         public static PlayerController Create(Transform parent, Vector3 pos, float yaw)
         {
             var go = new GameObject("Player");
+            go.layer = Layers.Player;
             go.transform.SetParent(parent, false);
             go.transform.position = pos;
             var p = go.AddComponent<PlayerController>();
@@ -53,7 +54,7 @@ namespace RagdollSandbox
 
         public void Tick()
         {
-            if (cc == null) return;
+            if (cc == null || Hidden) return;
             float dt = Time.deltaTime;
             if (dt <= 0f) return;
             var ps = Sandbox.Boot.player;
@@ -193,7 +194,17 @@ namespace RagdollSandbox
         {
             cc.enabled = false;
             transform.position = p;
-            cc.enabled = true;
+            cc.enabled = !Hidden;
+            velocity = Vector3.zero;
+            external = Vector3.zero;
+        }
+
+        /// <summary>Hidden while driving a car: no collision, no movement.</summary>
+        public bool Hidden { get; private set; }
+        public void SetHidden(bool hidden)
+        {
+            Hidden = hidden;
+            if (cc != null) cc.enabled = !hidden;
             velocity = Vector3.zero;
             external = Vector3.zero;
         }
@@ -261,7 +272,7 @@ namespace RagdollSandbox
     #endregion
 
     #region CameraRig
-    public enum CameraMode { FirstPerson, Follow, Possess, KillCam }
+    public enum CameraMode { FirstPerson, Follow, Possess, KillCam, Vehicle }
 
     public class CameraRig
     {
@@ -321,7 +332,7 @@ namespace RagdollSandbox
 
         public void SetMode(CameraMode m)
         {
-            if (m == CameraMode.Possess || m == CameraMode.Follow)
+            if (m == CameraMode.Possess || m == CameraMode.Follow || m == CameraMode.Vehicle)
             {
                 if (Mode == CameraMode.FirstPerson) { OrbitYaw = t.eulerAngles.y; OrbitPitch = 15f; }
                 focusInit = false;
@@ -370,6 +381,7 @@ namespace RagdollSandbox
             }
             if (Mode == CameraMode.Possess && Sandbox.Possessed == null) Mode = CameraMode.FirstPerson;
             if (Mode == CameraMode.Follow && Sandbox.Focus == null) Mode = CameraMode.FirstPerson;
+            if (Mode == CameraMode.Vehicle && (Sandbox.Vehicles == null || Sandbox.Vehicles.Driving == null)) Mode = CameraMode.FirstPerson;
             Vector3 pos;
             Quaternion rot;
             float dizzy = 0f;
@@ -380,6 +392,21 @@ namespace RagdollSandbox
                         var p = Sandbox.Player;
                         pos = p != null ? p.EyePosition : Vector3.up * 1.7f;
                         rot = p != null ? Quaternion.Euler(p.Pitch, p.Yaw, 0f) : Quaternion.identity;
+                        break;
+                    }
+                case CameraMode.Vehicle:
+                    {
+                        var car = Sandbox.Vehicles.Driving;
+                        if (CursorControl.Locked && !TimeControl.Paused)
+                        {
+                            Vector2 md = InputBridge.MouseDelta;
+                            OrbitYaw += md.x * 2.2f;
+                            OrbitPitch = Mathf.Clamp(OrbitPitch - md.y * 2.2f, -10f, 60f);
+                        }
+                        // drift back behind the car when the mouse is idle
+                        float carYaw = car.go.transform.eulerAngles.y;
+                        if (Mathf.Abs(car.Speed) > 2f) OrbitYaw = Mathf.LerpAngle(OrbitYaw, carYaw, dt * 1.5f);
+                        Orbit(car.go.transform.position + Vector3.up * 1.3f, 7f, dt, out pos, out rot, true);
                         break;
                     }
                 case CameraMode.KillCam:
@@ -450,6 +477,7 @@ namespace RagdollSandbox
                     var c = hits[i].collider;
                     if (Registry.PartOf(c) != null) continue;
                     if (Sandbox.Player != null && c == Sandbox.Player.Collider) continue;
+                    if (c.gameObject.layer == Layers.Vehicle) continue;
                     if (c.attachedRigidbody != null && !c.attachedRigidbody.isKinematic) continue;
                     if (hits[i].distance > 0.01f) d = Mathf.Min(d, hits[i].distance);
                 }

@@ -1007,6 +1007,29 @@ namespace RagdollSandbox
             CursorControl.SetLocked(false);
         }
 
+        /// <summary>Destroys and rebuilds the map with another seed (joining a host, or leaving an online session).</summary>
+        public void RebuildWorld(int seed, bool spawnRagdolls)
+        {
+            if (Sandbox.Vehicles != null) Sandbox.Vehicles.ExitDriving();
+            if (Sandbox.Possessed != null) { Sandbox.Possessed.SetPossessed(false); Sandbox.Possessed = null; }
+            if (Sandbox.Cam != null) Sandbox.Cam.SetMode(CameraMode.FirstPerson);
+            if (Sandbox.Test != null) Sandbox.Test.Abort("world rebuilt");
+            if (Sandbox.Tools != null) { Sandbox.Tools.ReleaseAll(); Sandbox.Tools.ClearSpawned(); }
+            for (int i = Sandbox.Ragdolls.Count - 1; i >= 0; i--) { var r = Sandbox.Ragdolls[i]; if (r != null) RemoveRagdoll(r); }
+            Sandbox.Ragdolls.Clear();
+            Sandbox.Explosions.Clear();
+            Sandbox.Decals.Clear();
+            Sandbox.Blood.Clear();
+            Sandbox.World.Destroy();
+            Sandbox.Seed = seed;
+            Sandbox.World = new WorldBuilder();
+            Sandbox.World.Build(runtimeRoot, seed);
+            Sandbox.Vehicles.ClearAll();
+            Quality.Refresh(this);
+            if (Sandbox.Player != null) { Sandbox.Player.Teleport(Sandbox.World.PlayerSpawn); Sandbox.Player.Yaw = Sandbox.World.PlayerSpawnYaw; }
+            if (spawnRagdolls) SpawnInitialRagdolls();
+        }
+
         public void ApplyPhysicsSettings()
         {
             TimeControl.BaseFixedDelta = physics.fixedTimestep;

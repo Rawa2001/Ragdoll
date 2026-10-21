@@ -1147,6 +1147,7 @@ namespace RagdollSandbox
                 p.rb.sleepThreshold = p.attached && Alive ? 0f : 0.01f;
             }
             ApplySolverSettings();
+            if (Puppet) SetPuppet(true);
         }
 
         /// <summary>True if the bone's primary segment still reaches its distal joint (not cut short).</summary>

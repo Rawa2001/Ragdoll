@@ -109,6 +109,7 @@ namespace RagdollSandbox
             ep.Init(kind, rb, col);
             Registry.RegisterDamageable(col, ep);
             Register(ep);
+            if (parent == null && Sandbox.IsHost && Sandbox.Net != null) Sandbox.Net.OnPropSpawned(go, NetSession.ExplosiveKindBase + (int)kind);
             return ep;
         }
 
@@ -189,6 +190,9 @@ namespace RagdollSandbox
                 Sandbox.Cam.AddFovKick(es.fovKick * k);
             }
             if (Sandbox.Player != null) Sandbox.Player.ExplosionPush(pos, radius, force);
+            // online: the host simulates, clients only see and hear it (bodies and props come in snapshots)
+            if (Sandbox.IsHost && Sandbox.Net != null) Sandbox.Net.OnExplosion(pos, radius, visualScale);
+            if (Sandbox.IsClient) return;
 
             // Physics
             pushed.Clear();
@@ -295,6 +299,8 @@ namespace RagdollSandbox
     {
         public ExplosiveKind Kind;
         public bool Detonated, Scheduled, IsWorldProp;
+        /// <summary>Network client copy: inert, moved by snapshots, removed by the host.</summary>
+        public bool Remote;
         public float Fuse = -1f;
         public float Health = 40f;
         Rigidbody rb;
@@ -346,6 +352,11 @@ namespace RagdollSandbox
         void Update()
         {
             if (Detonated) return;
+            if (Remote)
+            {
+                if (blink != null) blink.intensity = (Mathf.Repeat(Time.time * 1.5f, 1f) < 0.2f) ? 1.5f : 0f;
+                return;
+            }
             if (Fuse >= 0f)
             {
                 Fuse -= Time.deltaTime;
@@ -376,7 +387,7 @@ namespace RagdollSandbox
 
         void OnCollisionEnter(Collision c)
         {
-            if (Detonated) return;
+            if (Detonated || Remote) return;
             float imp = c.impulse.magnitude;
             if (Kind == ExplosiveKind.C4 && !stuck && Time.time > armTime - 0.15f) StickTo(c);
             if (Kind == ExplosiveKind.Grenade && imp > 0.3f && Sandbox.Audio != null) Sandbox.Audio.Play(Sfx.Clang, transform.position, Mathf.Clamp01(imp * 0.3f), 1.8f);
@@ -387,7 +398,7 @@ namespace RagdollSandbox
 
         void OnTriggerEnter(Collider other)
         {
-            if (Kind != ExplosiveKind.Landmine || Detonated || mineTriggered || Time.time < armTime) return;
+            if (Kind != ExplosiveKind.Landmine || Detonated || Remote || mineTriggered || Time.time < armTime) return;
             Rigidbody orb = other.attachedRigidbody;
             bool heavy = (orb != null && !orb.isKinematic && orb.mass > 4f) || Registry.PartOf(other) != null || other is CharacterController;
             if (!heavy) return;
@@ -426,7 +437,7 @@ namespace RagdollSandbox
 
         public void ApplyDamage(DamageInfo info)
         {
-            if (Detonated) return;
+            if (Detonated || Remote) return;
             if (Kind == ExplosiveKind.Grenade || Kind == ExplosiveKind.Mega) return;
             if (Kind == ExplosiveKind.C4) { if (info.type == DamageType.Blast && info.amount > 25f) Sandbox.Explosions.Schedule(this, 0.05f); return; }
             Health -= info.amount;

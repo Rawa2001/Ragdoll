@@ -12,6 +12,16 @@ namespace RagdollSandbox
     public class FxSystem
     {
         public ParticleSystem BloodDrops, BloodMist, Fire, Smoke, Sparks, Dust, Debris, Shockwave, Muzzle, Zaps, Splinters, Steam;
+        /// <summary>Live particles in every FX system (debug / HUD counter).</summary>
+        public int ParticleCount
+        {
+            get
+            {
+                return Count(BloodDrops) + Count(BloodMist) + Count(Fire) + Count(Smoke) + Count(Sparks) + Count(Dust) + Count(Debris) +
+                       Count(Shockwave) + Count(Muzzle) + Count(Zaps) + Count(Splinters) + Count(Steam);
+            }
+        }
+        static int Count(ParticleSystem ps) { return ps != null ? ps.particleCount : 0; }
         Transform root;
         Rng rng = new Rng(4242);
 
@@ -246,6 +256,7 @@ namespace RagdollSandbox
 
         public void EmitBloodSpray(Vector3 pos, Vector3 dir, float speed, float spreadDeg, int count, float size, Color color, Vector3 inherit)
         {
+            if (Sandbox.IsHost && Sandbox.Net != null) Sandbox.Net.BroadcastFx(NetFxKind.Blood, pos, dir.normalized * speed);
             if (Sandbox.BloodAmount <= 0.001f || Sandbox.Blood == null) return;
             int n = Mathf.RoundToInt(count * Mathf.Max(0.2f, Sandbox.BloodAmount) * Budget * Sandbox.Blood.SpawnScale(pos));
             dir = MathUtil.SafeNormal(dir, Vector3.up);

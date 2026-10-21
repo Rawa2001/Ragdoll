@@ -45,6 +45,29 @@ namespace RagdollSandbox
         float hillHeight;
 
         public int PropCount { get { return props.Count; } }
+        public List<WorldProp> Props { get { return props; } }
+        /// <summary>Awake dynamic props (debug counter).</summary>
+        public int ActivePropCount
+        {
+            get
+            {
+                int n = 0;
+                for (int i = 0; i < props.Count; i++) { var rb = props[i].rb; if (rb != null && !rb.isKinematic && !rb.IsSleeping()) n++; }
+                return n;
+            }
+        }
+
+        /// <summary>Removes the whole world (a network client rebuilds it with the host's seed).</summary>
+        public void Destroy()
+        {
+            BreakablePlank.ClearDebris();
+            if (root != null) UnityEngine.Object.Destroy(root.gameObject);
+            root = null;
+            props.Clear();
+            tickers.Clear();
+            lamps.Clear();
+            lampBulbs.Clear();
+        }
 
         public void Build(Transform parent, int seed)
         {
@@ -1377,6 +1400,7 @@ namespace RagdollSandbox
         public void WorldTick(float dt)
         {
             if (fuse < 0f) return;
+            if (Sandbox.IsClient) { fuse = -1f; return; }
             fuse -= dt;
             if (fuse > 0f) return;
             fuse = -1f;

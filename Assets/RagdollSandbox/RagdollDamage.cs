@@ -879,7 +879,7 @@ namespace RagdollSandbox
                 case DamageType.Blunt: case DamageType.Fall: part.blunt += amount; break;
                 case DamageType.Cut: part.cutDamage += amount; break;
                 case DamageType.Pierce: part.pierce += amount; break;
-                case DamageType.Blast: part.blast += amount; break;
+                case DamageType.Blast: case DamageType.Burn: part.blast += amount; break;
                 case DamageType.Crush: part.crush += amount; break;
                 case DamageType.Shock: part.shock += amount; break;
             }
@@ -991,6 +991,13 @@ namespace RagdollSandbox
                         if (part.id == PartId.Head && living) { vit.Knockout(amount * 0.1f * ds.knockoutScale); body.Organs.DamageAlong(part, d.point, d.point, 0.1f * s, amount * 0.4f); }
                         break;
                     }
+
+                case DamageType.Burn:
+                    // laser / fire: scorch stamp (accumulates), pain, a little charring of the clay
+                    Paint(part, d.point, StampKind.Burn, 0.022f * s, Mathf.Clamp01(0.25f + amount / 6f), Color.white, 0f, Vector3.zero);
+                    if (living) vit.AddPain(amount * 0.01f);
+                    if (living && body.Brain != null && rng.Value < 0.05f) body.Brain.OnPain(amount * 8f);
+                    break;
 
                 case DamageType.Shock:
                     Paint(part, d.point, StampKind.Shock, 0.03f * s, 0.6f, Color.white, 0f, Vector3.zero);

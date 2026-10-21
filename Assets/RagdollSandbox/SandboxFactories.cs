@@ -1031,7 +1031,7 @@ namespace RagdollSandbox
             var grad = new PixelCanvas(4, 64, Color.white); grad.Wrap = false;
             for (int y = 0; y < 64; y++) for (int x = 0; x < 4; x++) grad.Px[y * 4 + x] = new Color(1, 1, 1, 0.55f + 0.45f * y / 63f);
             Gradient = MakeSprite(grad.ToTexture("Gradient", false, TextureWrapMode.Clamp), Vector4.zero);
-            ToolIcons = new Sprite[11];
+            ToolIcons = new Sprite[12];
             for (int i = 0; i < ToolIcons.Length; i++) ToolIcons[i] = MakeSprite(MakeToolIcon(i), Vector4.zero);
         }
 
@@ -1110,6 +1110,12 @@ namespace RagdollSandbox
                     pc.Line(18, 36, 46, 36, 5, w, true);
                     pc.Line(32, 22, 22, 6, 6, w, true);
                     pc.Line(32, 22, 42, 6, 6, w, true);
+                    break;
+                case 10: // laser: emitter and beam
+                    pc.Rect(6, 26, 26, 38, w, true);
+                    pc.Rect(10, 16, 18, 26, w, true);
+                    pc.Line(26, 32, 58, 32, 3, w, true);
+                    pc.Circle(58, 32, 5, w, 1f, true);
                     break;
                 default: // rope
                     for (int k = 0; k < 6; k++) pc.Ellipse(14 + k * 7, 14 + k * 7, 6, 4, 0.78f, w, 1f, true);
@@ -1245,6 +1251,18 @@ namespace RagdollSandbox
             m.EnableKeyword("_EMISSION");
             m.SetColor("_EmissionColor", c);
             m.globalIlluminationFlags = MaterialGlobalIlluminationFlags.None;
+        }
+
+        /// <summary>Normal map for URP Lit (_BumpMap + _NORMALMAP) and the built-in Standard shader.</summary>
+        public static void SetNormalMap(Material m, Texture tex, float scale)
+        {
+            if (m == null || tex == null) return;
+            if (m.HasProperty("_BumpMap"))
+            {
+                m.SetTexture("_BumpMap", tex);
+                if (m.HasProperty("_BumpScale")) m.SetFloat("_BumpScale", scale);
+                m.EnableKeyword("_NORMALMAP");
+            }
         }
 
         public static void SetDoubleSided(Material m)
