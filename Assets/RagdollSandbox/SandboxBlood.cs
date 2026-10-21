@@ -1,6 +1,9 @@
-// Ragdoll Sandbox - blood simulation: pooled droplet/spray/mist particles with world collision, splat decals
-// (irregular blobs, directional streaks, wall drips), painting splatter into body textures, growing/merging/drying
-// puddles, bloody footprints and handprints that fade over the next steps, and drag smears.
+// Ragdoll Sandbox - blood simulation:
+//  * Droplets are a tiny custom simulation (arrays, no Rigidbody, no particle collision). Collision uses a small
+//    raycast budget per frame, round-robin over the live droplets (each cast covers the path since its last check).
+//    A hard cap, distance falloff and frame-time scaling keep the cost bounded. One ParticleSystem only renders them.
+//  * Splat decals (blobs, streaks, wall drips), painting into body textures, growing/merging/drying puddles (capped),
+//    bloody footprints and handprints, drag smears. Clay look: chunky clay crumbs instead of liquid.
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -23,6 +26,15 @@ namespace RagdollSandbox
 
         Puddle[] puddles;
         int nextPuddle;
+        // droplets
+        Vector3[] dPos, dVel, dLast;
+        float[] dSize, dLife;
+        Color32[] dColor;
+        int dCount, dCap, rr;
+        ParticleSystem.Particle[] parts;
+        public int CastsLastFrame, DropletCount;
+        public bool ClayMode;
+        float frameScale = 1f;
         Mesh[] puddleMeshes;
         MaterialPropertyBlock mpb;
         Transform root;
@@ -44,6 +56,10 @@ namespace RagdollSandbox
             root = new GameObject("Blood").transform;
             root.SetParent(parent, false);
             mpb = new MaterialPropertyBlock();
+            dCap = Mathf.Clamp(Sandbox.Boot.blood.maxDroplets, 32, 4000);
+            dPos = new Vector3[dCap]; dVel = new Vector3[dCap]; dLast = new Vector3[dCap];
+            dSize = new float[dCap]; dLife = new float[dCap]; dColor = new Color32[dCap];
+            parts = new ParticleSystem.Particle[dCap];
             puddleMeshes = new Mesh[4];
             for (int i = 0; i < 4; i++)
             {
@@ -70,6 +86,7 @@ namespace RagdollSandbox
 
         public void Clear()
         {
+            dCount = 0;
             if (puddles == null) return;
             for (int i = 0; i < puddles.Length; i++) { puddles[i].alive = false; puddles[i].go.SetActive(false); }
             lastPrint.Clear();
@@ -149,10 +166,109 @@ namespace RagdollSandbox
             }
         }
 
+        /// <summary>Spawn-rate multiplier: fewer droplets far from the camera and when frames are slow.</summary>
+        public float SpawnScale(Vector3 pos)
+        {
+            float k = frameScale;
+            if (Sandbox.MainCamera != null)
+            {
+                float d = (pos - Sandbox.MainCamera.transform.position).magnitude;
+                if (d > 12f) k *= Mathf.Clamp(12f / d, 0.15f, 1f);
+            }
+            return k;
+        }
+
+        /// <summary>Spawns one droplet (respecting the cap; when full, the oldest is replaced).</summary>
+        public void Drop(Vector3 pos, Vector3 vel, float size, Color color, bool scaled = true)
+        {
+            if (dPos == null || Sandbox.BloodAmount <= 0.001f || !MathUtil.IsFinite(pos) || !MathUtil.IsFinite(vel)) return;
+            if (scaled && rng.Value > SpawnScale(pos)) return;
+            int cap = Mathf.Min(dCap, Sandbox.Boot.Quality != null ? Sandbox.Boot.Quality.State.bloodDroplets : dCap);
+            int i;
+            if (dCount < cap) i = dCount++;
+            else i = rng.Range(0, dCount);
+            if (ClayMode) { size *= 1.6f; color = Color.Lerp(color, new Color(0.62f, 0.12f, 0.1f), 0.5f); }
+            dPos[i] = pos; dVel[i] = vel; dLast[i] = pos; dSize[i] = size; dLife[i] = 3f; dColor[i] = color;
+        }
+
+        void SimulateDroplets(float dt)
+        {
+            if (dt <= 0f) { RenderDroplets(); return; }
+            Vector3 g = Physics.gravity;
+            float drag = ClayMode ? 0.05f : 0.25f;
+            float killY = Sandbox.Boot.world.killPlaneY;
+            for (int i = 0; i < dCount; i++)
+            {
+                dVel[i] += g * dt;
+                dVel[i] *= 1f - drag * dt;
+                dPos[i] += dVel[i] * dt;
+                dLife[i] -= dt;
+                if (dLife[i] <= 0f || dPos[i].y < killY) { RemoveDroplet(i); i--; }
+            }
+            // collision: a fixed raycast budget per frame, round-robin
+            int budget = Sandbox.Boot.Quality != null ? Sandbox.Boot.Quality.State.bloodRaycasts : 48;
+            int casts = 0;
+            int n = Mathf.Min(budget, dCount);
+            for (int k = 0; k < n && dCount > 0; k++)
+            {
+                if (rr >= dCount) rr = 0;
+                int i = rr;
+                Vector3 a = dLast[i], b = dPos[i];
+                Vector3 seg = b - a;
+                float len = seg.magnitude;
+                casts++;
+                RaycastHit hit;
+                if (len > 1e-4f && Physics.Raycast(a, seg / len, out hit, len, Layers.BloodMask, QueryTriggerInteraction.Ignore))
+                {
+                    OnDropletHit(hit.point, hit.normal, dVel[i], hit.collider, dSize[i], dColor[i]);
+                    RemoveDroplet(i);
+                    continue;
+                }
+                dLast[i] = b;
+                rr++;
+            }
+            CastsLastFrame = casts;
+            DropletCount = dCount;
+            RenderDroplets();
+        }
+
+        void RemoveDroplet(int i)
+        {
+            int last = dCount - 1;
+            if (i != last)
+            {
+                dPos[i] = dPos[last]; dVel[i] = dVel[last]; dLast[i] = dLast[last];
+                dSize[i] = dSize[last]; dLife[i] = dLife[last]; dColor[i] = dColor[last];
+            }
+            dCount = last;
+        }
+
+        void RenderDroplets()
+        {
+            var ps = Sandbox.Fx != null ? Sandbox.Fx.BloodDrops : null;
+            if (ps == null) return;
+            for (int i = 0; i < dCount; i++)
+            {
+                var p = new ParticleSystem.Particle();
+                p.position = dPos[i];
+                p.velocity = ClayMode ? dVel[i] * 0.2f : dVel[i];
+                p.startSize = dSize[i];
+                p.startColor = dColor[i];
+                p.startLifetime = 3f;
+                p.remainingLifetime = Mathf.Max(0.05f, dLife[i]);
+                parts[i] = p;
+            }
+            ps.SetParticles(parts, dCount);
+        }
+
         public void Tick(float dt)
         {
             frame++;
             decalsThisFrame = 0;
+            var q = Sandbox.Boot.Quality;
+            frameScale = q != null ? q.State.bloodScale : 1f;
+            ClayMode = Sandbox.Boot.character.look == BodyLook.Clay;
+            SimulateDroplets(dt);
             if (puddles == null) return;
             var bs = Sandbox.Boot.blood;
             colorTimer -= dt;
@@ -270,19 +386,18 @@ namespace RagdollSandbox
         }
 
         /// <summary>A blood droplet hit something: splat decal on the world, paint on bodies, drips on walls.</summary>
-        public void OnDropletHit(Vector3 point, Vector3 normal, Vector3 velocity, Component other)
+        public void OnDropletHit(Vector3 point, Vector3 normal, Vector3 velocity, Collider col, float dropSize, Color32 dropColor)
         {
             if (decalsThisFrame > 40) return;
             decalsThisFrame++;
             var bs = Sandbox.Boot.blood;
             float amount = Mathf.Sqrt(Mathf.Max(0.05f, Sandbox.BloodAmount));
-            Color c = Color.Lerp(bs.arterial, bs.venous, rng.Value);
+            Color c = Color.Lerp(dropColor, bs.venous, rng.Value * 0.5f);
             c.a = rng.Range(0.75f, 0.95f);
-            var col = other as Collider;
             if (col == null || (Sandbox.Player != null && col == Sandbox.Player.Collider)) return;
             BodyPart part = Registry.PartOf(col);
             float speed = velocity.magnitude;
-            float size = Mathf.Clamp(0.035f + speed * 0.012f, 0.03f, 0.16f) * amount * rng.Range(0.8f, 1.3f);
+            float size = Mathf.Clamp(0.035f + speed * 0.012f, 0.03f, 0.16f) * amount * rng.Range(0.8f, 1.3f) * Mathf.Clamp(dropSize / 0.02f, 0.6f, 2f);
             if (part != null)
             {
                 if (part.body != null && part.body.Damage != null) part.body.Damage.PaintBlood(part, point, size * 0.6f, c);
@@ -327,24 +442,5 @@ namespace RagdollSandbox
         }
     }
 
-    /// <summary>Receives blood droplet particle collisions (world collision module, collision messages on).</summary>
-    public class BloodCollisionHandler : MonoBehaviour
-    {
-        ParticleSystem ps;
-        readonly List<ParticleCollisionEvent> events = new List<ParticleCollisionEvent>(64);
-
-        void Awake() { ps = GetComponent<ParticleSystem>(); }
-
-        void OnParticleCollision(GameObject other)
-        {
-            if (ps == null || Sandbox.Blood == null) return;
-            int n = ps.GetCollisionEvents(other, events);
-            for (int i = 0; i < n && i < 16; i++)
-            {
-                var e = events[i];
-                Sandbox.Blood.OnDropletHit(e.intersection, e.normal, e.velocity, e.colliderComponent);
-            }
-        }
-    }
     #endregion
 }

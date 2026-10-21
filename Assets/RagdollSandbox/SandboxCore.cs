@@ -553,6 +553,53 @@ namespace RagdollSandbox
     }
     #endregion
 
+    #region Layers
+    /// <summary>Unnamed user layers used purely from code (no project settings needed). The collision matrix entries
+    /// touched here are saved at boot and restored when the sandbox is destroyed.</summary>
+    public static class Layers
+    {
+        public const int Ragdoll = 25, Debris = 26, Gibs = 27, Player = 28, Vehicle = 29;
+        public static int GroundMask, GrabMask, BloodMask, ToolMask;
+        static bool[,] saved;
+        static readonly int[] used = { Ragdoll, Debris, Gibs, Player, Vehicle };
+
+        public static void Setup()
+        {
+            saved = new bool[32, 32];
+            for (int a = 0; a < 32; a++)
+                for (int b = 0; b < 32; b++) saved[a, b] = Physics.GetIgnoreLayerCollision(a, b);
+            for (int i = 0; i < used.Length; i++)
+                for (int j = 0; j < 32; j++) Physics.IgnoreLayerCollision(used[i], j, false);
+            // pairs that never matter: debris vs debris / player / ragdolls, gibs vs player
+            Physics.IgnoreLayerCollision(Debris, Debris, true);
+            Physics.IgnoreLayerCollision(Debris, Player, true);
+            Physics.IgnoreLayerCollision(Debris, Ragdoll, true);
+            Physics.IgnoreLayerCollision(Gibs, Player, true);
+            Physics.IgnoreLayerCollision(Gibs, Debris, true);
+            GroundMask = ~((1 << Debris) | (1 << Player) | (1 << 2));
+            GrabMask = ~((1 << Debris) | (1 << Player) | (1 << Gibs) | (1 << 2));
+            BloodMask = ~((1 << Debris) | (1 << Player) | (1 << 2));
+            ToolMask = ~((1 << Debris) | (1 << 2));
+        }
+
+        public static void Restore()
+        {
+            if (saved == null) return;
+            for (int a = 0; a < 32; a++)
+                for (int b = a; b < 32; b++) Physics.IgnoreLayerCollision(a, b, saved[a, b]);
+            saved = null;
+        }
+
+        public static void SetRecursive(GameObject go, int layer)
+        {
+            if (go == null) return;
+            go.layer = layer;
+            var t = go.transform;
+            for (int i = 0; i < t.childCount; i++) SetRecursive(t.GetChild(i).gameObject, layer);
+        }
+    }
+    #endregion
+
     #region Registry and events
     public enum DamageType { Blunt, Cut, Pierce, Blast, Crush, Shock, Fall }
 
@@ -569,6 +616,9 @@ namespace RagdollSandbox
         public float depth;
         public float radius;
         public bool fromPlayer;
+        public Vector3 along;      // cut direction (blades, lasers)
+        public bool crater;        // point-blank shotgun: one large crater
+        public int attacker;       // network player id (-1 = local / world)
 
         public static DamageInfo Make(DamageType t, float amount, Vector3 point, Vector3 dir)
         {
@@ -580,6 +630,7 @@ namespace RagdollSandbox
             d.normal = -d.direction;
             d.radius = 0.05f;
             d.depth = 0.03f;
+            d.attacker = -1;
             return d;
         }
     }
@@ -604,10 +655,11 @@ namespace RagdollSandbox
         public static readonly Dictionary<Collider, IDamageable> Damageables = new Dictionary<Collider, IDamageable>(512);
         public static readonly Dictionary<Collider, IMovingSurface> Movers = new Dictionary<Collider, IMovingSurface>(32);
         public static readonly Dictionary<Collider, Organ> Organs = new Dictionary<Collider, Organ>(128);
+        public static readonly Dictionary<Rigidbody, Vehicle> Vehicles = new Dictionary<Rigidbody, Vehicle>(8);
 
         public static void Clear()
         {
-            Parts.Clear(); PartsByBody.Clear(); Damageables.Clear(); Movers.Clear(); Organs.Clear();
+            Parts.Clear(); PartsByBody.Clear(); Damageables.Clear(); Movers.Clear(); Organs.Clear(); Vehicles.Clear();
         }
 
         public static BodyPart PartOf(Collider c)
@@ -659,6 +711,8 @@ namespace RagdollSandbox
         public static event Action<RagdollBody, OrganType> OrganDestroyed;
         public static event Action<Vector3, float> Explosion;
         public static event Action<string, Color> Toast;
+        /// <summary>Kill-feed style event: subject, what happened.</summary>
+        public static event Action<string, string, Color> Kill;
 
         public static void RaiseDamaged(RagdollBody b, BodyPart p, DamageInfo d) { var h = Damaged; if (h != null) h(b, p, d); }
         public static void RaiseSevered(RagdollBody b, PartId id, BodyPart piece) { var h = Severed; if (h != null) h(b, id, piece); }
@@ -670,11 +724,12 @@ namespace RagdollSandbox
         public static void RaiseOrganDestroyed(RagdollBody b, OrganType o) { var h = OrganDestroyed; if (h != null) h(b, o); }
         public static void RaiseExplosion(Vector3 p, float r) { var h = Explosion; if (h != null) h(p, r); }
         public static void RaiseToast(string text, Color c) { var h = Toast; if (h != null) h(text, c); }
+        public static void RaiseKill(string who, string what, Color c) { var h = Kill; if (h != null) h(who, what, c); }
 
         public static void ClearAll()
         {
             Damaged = null; Severed = null; BleedStart = null; Death = null; Unconscious = null; Woke = null;
-            Fractured = null; OrganDestroyed = null; Explosion = null; Toast = null;
+            Fractured = null; OrganDestroyed = null; Explosion = null; Toast = null; Kill = null;
         }
     }
     #endregion

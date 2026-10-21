@@ -4,7 +4,7 @@
 //  * OrganSystem: brain, heart, lungs, liver, stomach, kidneys, intestines; organ damage effects; rupture -> spilled organs
 //    on soft tethers that can be torn free.
 //  * DamageSystem: collision impulses, crush, falls, blades, bullets, blasts, shock; bruises, dents, gashes, fractures.
-//  * DismemberSystem: joint severing and blade slicing at any ring with generated cross-section caps.
+//  * DismemberSystem: joint severing and plane slicing anywhere along a bone (mesh + physics split, caps, stumps).
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -389,8 +389,10 @@ namespace RagdollSandbox
                 Vector3 pos = w.WorldPosition;
                 Vector3 n = w.WorldNormal;
                 Vector3 vel = w.part.rb != null ? w.part.rb.GetPointVelocity(pos) : Vector3.zero;
-                // drips
-                w.dripAccum += rate * 900f * amount * dt;
+                // drips, pulsing with the heartbeat
+                float ph = body.Vitals.HeartPhase;
+                float pulse = body.Vitals.HeartRate > 5f ? 0.55f + 1.6f * Mathf.Exp(-Mathf.Pow((ph - 0.08f) * 8f, 2f)) : 0.5f;
+                w.dripAccum += rate * 900f * amount * dt * pulse;
                 int drops = 0;
                 while (w.dripAccum >= 1f && drops < 6)
                 {
@@ -447,17 +449,14 @@ namespace RagdollSandbox
 
         public void HealAll() { Wounds.Clear(); }
 
-        /// <summary>Wounds beyond the cut move to the new piece.</summary>
-        public void MoveWounds(BodyPart from, BodyPart to, float tCut)
+        /// <summary>Wounds beyond a split (axis coordinate of the segment) move to the new distal segment.</summary>
+        public void MoveWounds(BodyPart from, BodyPart to, float split)
         {
-            var shape = from.visual != null ? from.visual.shape : null;
-            if (shape == null) return;
             for (int i = 0; i < Wounds.Count; i++)
             {
                 var w = Wounds[i];
                 if (w.part != from) continue;
-                float t = shape.TOf(w.localPos / body.Scale);
-                if (t > tCut) w.part = to;
+                if (Vector3.Dot(w.localPos, from.segAxis) > split) w.part = to;
             }
         }
 
@@ -583,9 +582,9 @@ namespace RagdollSandbox
             var o = new Organ();
             o.type = type; o.body = body; o.host = host; o.mass = mass; o.radius = radius;
             o.go = new GameObject(type.ToString());
+            o.go.layer = Layers.Gibs;
             o.t = o.go.transform;
-            Transform inner = host.transform.Find("Inner");
-            o.t.SetParent(inner != null ? inner : host.transform, false);
+            o.t.SetParent(host.inner != null ? host.inner : host.transform, false);
             o.t.localPosition = localRef;
             o.t.localRotation = rot;
             o.restLocalPos = localRef;
@@ -718,18 +717,16 @@ namespace RagdollSandbox
             Compat.SetVelocity(o.rb, v);
         }
 
-        /// <summary>Moves organs whose rest position lies beyond the cut to the new piece (frames are identical at cut time).</summary>
-        public void Reassign(BodyPart from, BodyPart to, TubeShape shape, float tCut)
+        /// <summary>Moves organs whose rest position lies beyond a split to the new segment (frames are identical then).</summary>
+        public void Reassign(BodyPart from, BodyPart to, float split)
         {
-            Transform inner = to.transform.Find("Inner");
             for (int i = 0; i < All.Count; i++)
             {
                 var o = All[i];
                 if (o.host != from || o.spilled) continue;
-                float t = shape.TOf(o.restLocalPos);
-                if (t <= tCut) continue;
+                if (Vector3.Dot(o.restLocalPos * body.Scale, from.segAxis) <= split) continue;
                 o.host = to;
-                o.t.SetParent(inner != null ? inner : to.transform, false);
+                o.t.SetParent(to.inner != null ? to.inner : to.transform, false);
                 o.t.localPosition = o.restLocalPos;
                 o.t.localRotation = o.restLocalRot;
             }
@@ -810,6 +807,7 @@ namespace RagdollSandbox
         readonly RagdollBody body;
         readonly float[] lastSound = new float[PartInfo.Count];
         readonly bool[] spinal = new bool[PartInfo.Count];
+        readonly float[] lastDent = new float[PartInfo.Count];
         float breakRefresh;
         Rng rng;
 
@@ -832,9 +830,15 @@ namespace RagdollSandbox
             ContactPoint cp = c.GetContact(0);
             Vector3 n = cp.normal;
             Vector3 rel = c.relativeVelocity;
-            float vn = Mathf.Abs(Vector3.Dot(rel, n));
+            // vehicles: Euphoria-style hit reaction
+            Vehicle veh;
+            if (c.rigidbody != null && Registry.Vehicles.TryGetValue(c.rigidbody, out veh) && veh != null)
+            {
+                float speed = rel.magnitude;
+                if (speed > 3f) body.Brain.OnVehicleHit(speed, rel.normalized);
+            }
             // trip detection
-            if ((part.id == PartId.FootL || part.id == PartId.FootR) && Mathf.Abs(n.y) < 0.5f)
+            if (PartInfo.IsFoot(part.id) && Mathf.Abs(n.y) < 0.5f)
             {
                 int side = part.id == PartId.FootL ? 0 : 1;
                 body.Locomotion.OnFootBlocked(side, MathUtil.Flat(rel).magnitude);
@@ -862,13 +866,13 @@ namespace RagdollSandbox
 
         public void Apply(BodyPart part, DamageInfo d)
         {
-            if (part == null || body == null) return;
+            if (part == null || body == null || body.Puppet) return;
             var ds = Sandbox.Boot.damage;
             var gore = Sandbox.Gore;
             float amount = d.amount;
             if (d.type == DamageType.Blast) amount *= ds.explosionDamageScale;
             if (amount <= 0f || !MathUtil.IsFinite(amount)) return;
-            bool living = part.attached && !part.isPiece;
+            bool living = part.attached && !part.cutOff;
             part.health = Mathf.Max(0f, part.health - amount);
             switch (d.type)
             {
@@ -879,35 +883,37 @@ namespace RagdollSandbox
                 case DamageType.Crush: part.crush += amount; break;
                 case DamageType.Shock: part.shock += amount; break;
             }
-            var vis = part.visual;
+            var skin = body.Skin;
             var vit = body.Vitals;
             if (living)
             {
                 vit.TotalTrauma += amount;
-                vit.AddPain(amount * 0.012f * (part.id == PartId.HandL || part.id == PartId.HandR || part.id == PartId.FootL || part.id == PartId.FootR ? 1.3f : 1f));
+                vit.AddPain(amount * 0.012f * (PartInfo.IsHand(part.id) || PartInfo.IsFoot(part.id) ? 1.3f : 1f));
                 vit.AddAdrenaline(0.05f + amount * 0.004f);
             }
             Vector3 inward = MathUtil.SafeNormal(d.direction, -d.normal);
             Vector3 outward = -inward;
             float s = body.Scale;
             float deform = ds.deformationScale;
+            bool canDent = deform > 0f && Time.time - lastDent[(int)part.id] > 0.12f;
+            Color bloodC = Sandbox.Boot.blood.arterial;
             switch (d.type)
             {
                 case DamageType.Blunt:
                 case DamageType.Fall:
                 case DamageType.Crush:
-                    Paint(part, d.point, StampKind.Bruise, Mathf.Clamp(0.025f + amount * 0.0018f, 0.025f, 0.09f) * s, 0f, Mathf.Clamp01(amount / 25f), Color.white, 0f);
-                    if (vis != null && deform > 0f && amount > 4f)
+                    Paint(part, d.point, StampKind.Bruise, Mathf.Clamp(0.025f + amount * 0.0018f, 0.025f, 0.09f) * s, Mathf.Clamp01(amount / 25f), Color.white, 0f, Vector3.zero);
+                    if (skin != null && canDent && amount > 4f)
                     {
-                        vis.Dent(d.point, inward, Mathf.Clamp(0.05f + amount * 0.001f, 0.05f, 0.12f) * s, Mathf.Min(ds.maxDentDepth, amount * 0.0006f * deform) * s);
-                        if (amount > 8f) vis.Swell(d.point, 0.04f * s, 0.002f * s);
+                        lastDent[(int)part.id] = Time.time;
+                        skin.Dent(part, d.point, inward, Mathf.Clamp(0.05f + amount * 0.001f, 0.05f, 0.12f) * s, Mathf.Min(ds.maxDentDepth, amount * 0.0006f * deform) * s);
                     }
-                    if (d.type == DamageType.Crush && part.crush > 40f && vis != null && deform > 0f)
-                        vis.Flatten(d.point, d.normal.sqrMagnitude > 0f ? d.normal : Vector3.up, Mathf.Lerp(0.85f, 0.5f, Mathf.Clamp01((part.crush - 40f) / 120f)));
+                    if (d.type == DamageType.Crush && part.crush > 40f && skin != null && canDent)
+                        skin.Squash(part, d.point, d.normal.sqrMagnitude > 0f ? d.normal : Vector3.up, 0.12f * s, Mathf.Lerp(0.1f, 0.45f, Mathf.Clamp01((part.crush - 40f) / 120f)) * deform);
                     if (amount > 25f && gore != GoreLevel.Off && rng.Value < (amount - 25f) / 60f)
                     {
                         body.Wounds.Add(part, d.point, outward, Mathf.Clamp01(amount / 80f), 0.01f * s, DamageType.Cut);
-                        PaintCut(part, d.point, rng.OnUnitSphere(), 0.025f * s, 0.3f);
+                        Paint(part, d.point, StampKind.Cut, 0.025f * s, 1f, Color.white, 0.3f, rng.OnUnitSphere());
                     }
                     if (d.impulse >= PartInfo.FractureImpulse[(int)part.id] * ds.fractureThresholdScale * body.MassScale) Fracture(part, d.point, d.impulse);
                     if (part.id == PartId.Head && living)
@@ -917,22 +923,23 @@ namespace RagdollSandbox
                         body.Organs.DamageAlong(part, d.point, d.point, 0.05f * s, amount * 0.35f);
                     }
                     else if (amount > 20f) body.Organs.DamageAlong(part, d.point, d.point + inward * 0.06f * s, 0.05f * s, amount * 0.25f);
-                    if (d.type == DamageType.Crush && Sandbox.Gore == GoreLevel.Full && part.crush > 90f && PartInfo.IsTorso(part.id)) body.Organs.Rupture(part, d.point, d.normal);
+                    if (d.type == DamageType.Crush && gore == GoreLevel.Full && part.crush > 90f && PartInfo.IsTorso(part.id)) body.Organs.Rupture(part, d.point, d.normal);
                     break;
 
                 case DamageType.Cut:
                     {
                         float len = Mathf.Max(d.radius, 0.03f * s);
-                        Vector3 along = Vector3.Cross(inward, part.transform.TransformDirection(part.visual != null ? part.visual.shape.Axis : Vector3.up));
+                        Vector3 along = d.along.sqrMagnitude > 0.5f ? d.along : Vector3.Cross(inward, part.transform.TransformDirection(part.segAxis));
                         if (along.sqrMagnitude < 1e-4f) along = rng.OnUnitSphere();
                         along.Normalize();
                         if (gore != GoreLevel.Off)
                         {
-                            PaintCut(part, d.point, along, len, Mathf.Clamp01(d.depth / (0.03f * s)));
+                            Paint(part, d.point, StampKind.Tear, len * 0.8f, 1f, Color.white, 0f, Vector3.zero);
+                            Paint(part, d.point, StampKind.Cut, len, 1f, Color.white, Mathf.Clamp01(d.depth / (0.03f * s)), along);
                             body.Wounds.Add(part, d.point, outward, Mathf.Clamp01(amount / 40f), d.depth, DamageType.Cut);
-                            if (vis != null && deform > 0f) vis.Gash(d.point, along, inward, len * 2f, Mathf.Min(0.015f * s, d.depth * 0.4f));
+                            if (skin != null && canDent && d.depth > 0.012f * s) { lastDent[(int)part.id] = Time.time; skin.Dent(part, d.point, inward, len * 0.6f, Mathf.Min(0.006f * s, d.depth * 0.25f)); }
                         }
-                        else Paint(part, d.point, StampKind.Bruise, 0.03f * s, 0f, 0.6f, Color.white, 0f);
+                        else Paint(part, d.point, StampKind.Bruise, 0.03f * s, 0.6f, Color.white, 0f, Vector3.zero);
                         body.Organs.DamageAlong(part, d.point, d.point + inward * d.depth, 0.03f * s, amount * 1.2f);
                         if (PartInfo.IsTorso(part.id) && part.cutDamage > Sandbox.Boot.dismember.ruptureThreshold && d.depth > 0.04f * s) body.Organs.Rupture(part, d.point, outward);
                         if (part.id == PartId.Neck && d.depth > 0.03f * s && living) body.Wounds.Add(part, d.point, outward, 1f, d.depth, DamageType.Cut, true);
@@ -941,20 +948,26 @@ namespace RagdollSandbox
 
                 case DamageType.Pierce:
                     {
+                        // real holes: entry, and an exit hole when the bullet passes through
+                        float r = Mathf.Max(0.006f * s, d.radius);
                         if (gore != GoreLevel.Off)
                         {
-                            Paint(part, d.point, StampKind.Hole, 0.009f * s, 0f, 1f, Color.white, 0f);
+                            Paint(part, d.point, StampKind.Tear, r * 2.2f, 1f, Color.white, 0f, Vector3.zero);
+                            Paint(part, d.point, StampKind.Hole, r * 1.3f, 1f, Color.white, 0f, Vector3.zero);
+                            if (skin != null) skin.Hole(part, d.point, inward, r, Mathf.Max(d.depth, 0.04f * s) * 0.6f, d.crater);
                             body.Wounds.Add(part, d.point, outward, Mathf.Clamp01(amount / 45f), Mathf.Max(d.depth, 0.03f * s), DamageType.Pierce);
                             if (d.hasExit)
                             {
-                                Paint(part, d.exitPoint, StampKind.Meat, 0.018f * s, 0f, 1f, Sandbox.Boot.blood.arterial, 0.3f);
+                                Paint(part, d.exitPoint, StampKind.Tear, r * 3f, 1f, Color.white, 0f, Vector3.zero);
+                                Paint(part, d.exitPoint, StampKind.Meat, r * 1.8f, 1f, bloodC, 0.3f, Vector3.zero);
+                                if (skin != null) skin.Hole(part, d.exitPoint, -inward, r * 1.5f, Mathf.Max(d.depth, 0.04f * s) * 0.45f, false);
                                 body.Wounds.Add(part, d.exitPoint, inward, Mathf.Clamp01(amount / 35f), 0.03f * s, DamageType.Pierce);
-                                if (Sandbox.Fx != null) Sandbox.Fx.EmitBloodSpray(d.exitPoint, inward, 3.5f, 25f, 10, 0.02f, Sandbox.Boot.blood.arterial, part.rb != null ? Compat.GetVelocity(part.rb) : Vector3.zero);
+                                if (Sandbox.Fx != null) Sandbox.Fx.EmitBloodSpray(d.exitPoint, inward, 3.5f, 25f, 10, 0.02f, bloodC, part.rb != null ? Compat.GetVelocity(part.rb) : Vector3.zero);
                             }
                         }
+                        else if (skin != null && canDent) { lastDent[(int)part.id] = Time.time; skin.Dent(part, d.point, inward, 0.02f * s, 0.004f * s); }
                         Vector3 end = d.hasExit ? d.exitPoint : d.point + inward * Mathf.Max(d.depth, 0.08f * s);
                         body.Organs.DamageAlong(part, d.point, end, 0.025f * s, amount * 2.2f);
-                        if (vis != null && deform > 0f) vis.Dent(d.point, inward, 0.02f * s, 0.004f * s);
                         if (amount > 20f && rng.Value < 0.2f) Fracture(part, d.point, PartInfo.FractureImpulse[(int)part.id] * 2f);
                         if (PartInfo.IsTorso(part.id) && part.pierce > 140f && gore == GoreLevel.Full) body.Organs.Rupture(part, d.point, outward);
                         break;
@@ -962,12 +975,13 @@ namespace RagdollSandbox
 
                 case DamageType.Blast:
                     {
-                        Paint(part, d.point, StampKind.Burn, Mathf.Clamp(0.04f + amount * 0.002f, 0.04f, 0.12f) * s, 0f, Mathf.Clamp01(amount / 40f), Color.white, 0f);
-                        Paint(part, d.point, StampKind.Bruise, 0.06f * s, 0f, Mathf.Clamp01(amount / 30f), Color.white, 0f);
-                        if (vis != null && deform > 0f) vis.Dent(d.point, inward, 0.09f * s, Mathf.Min(ds.maxDentDepth, amount * 0.0004f * deform) * s);
+                        Paint(part, d.point, StampKind.Burn, Mathf.Clamp(0.04f + amount * 0.002f, 0.04f, 0.12f) * s, Mathf.Clamp01(amount / 40f), Color.white, 0f, Vector3.zero);
+                        Paint(part, d.point, StampKind.Bruise, 0.06f * s, Mathf.Clamp01(amount / 30f), Color.white, 0f, Vector3.zero);
+                        if (skin != null && canDent) { lastDent[(int)part.id] = Time.time; skin.Dent(part, d.point, inward, 0.09f * s, Mathf.Min(ds.maxDentDepth, amount * 0.0004f * deform) * s); }
                         if (amount > 18f && gore != GoreLevel.Off)
                         {
-                            Paint(part, d.point, StampKind.Meat, Mathf.Clamp(amount * 0.0007f, 0.015f, 0.06f) * s, 0f, 1f, Sandbox.Boot.blood.arterial, amount > 60f ? 0.8f : 0.3f);
+                            Paint(part, d.point, StampKind.Tear, Mathf.Clamp(amount * 0.001f, 0.02f, 0.08f) * s, 1f, Color.white, 0f, Vector3.zero);
+                            Paint(part, d.point, StampKind.Meat, Mathf.Clamp(amount * 0.0007f, 0.015f, 0.06f) * s, 1f, bloodC, amount > 60f ? 0.8f : 0.3f, Vector3.zero);
                             body.Wounds.Add(part, d.point, outward, Mathf.Clamp01(amount / 70f), 0.02f * s, DamageType.Blast);
                         }
                         body.Organs.DamageAlong(part, d.point, d.point + inward * 0.1f * s, 0.06f * s, amount * 0.5f);
@@ -979,7 +993,7 @@ namespace RagdollSandbox
                     }
 
                 case DamageType.Shock:
-                    Paint(part, d.point, StampKind.Shock, 0.03f * s, 0f, 0.6f, Color.white, 0f);
+                    Paint(part, d.point, StampKind.Shock, 0.03f * s, 0.6f, Color.white, 0f, Vector3.zero);
                     body.Muscles.Spasm(1.1f);
                     if (living)
                     {
@@ -995,80 +1009,75 @@ namespace RagdollSandbox
             body.NotifyDamaged(part, d);
         }
 
-        public void Paint(BodyPart part, Vector3 world, StampKind kind, float radius, float angle, float intensity, Color color, float depth)
+        public void Paint(BodyPart part, Vector3 world, StampKind kind, float radius, float intensity, Color color, float depth, Vector3 along)
         {
-            if (part == null || part.visual == null || part.visual.canvas == null) return;
-            if (Sandbox.Gore == GoreLevel.Off && (kind == StampKind.Blood || kind == StampKind.Meat || kind == StampKind.Cut || kind == StampKind.Hole)) return;
-            float t;
-            Vector2 uv = part.visual.shape.UVOf(part.visual.ToRef(world), out t);
-            part.visual.canvas.AddStamp(kind, uv, Mathf.Clamp01(t), radius, angle, intensity, color, depth);
+            if (part == null || body.Skin == null) return;
+            body.Skin.Paint(part, world, kind, radius, intensity, color, depth, along);
         }
 
-        public void PaintCut(BodyPart part, Vector3 world, Vector3 alongWorld, float halfLen, float depth)
-        {
-            if (part == null || part.visual == null) return;
-            var shape = part.visual.shape;
-            float t;
-            Vector3 refP = part.visual.ToRef(world);
-            Vector2 uv = shape.UVOf(refP, out t);
-            Vector3 refDir = part.visual.DirToRef(alongWorld);
-            Vector3 axis = shape.Axis;
-            float circ = Mathf.Max(0.01f, shape.Circumference(Mathf.Clamp01(t)));
-            Vector3 radial = refP - shape.Center(Mathf.Clamp01(t));
-            Vector3 tangent = Vector3.Cross(axis, radial).normalized;
-            float du = Vector3.Dot(refDir, tangent) / circ * part.visual.canvas.W;
-            float dv = Vector3.Dot(refDir, axis) / shape.TotalArc * part.visual.canvas.H;
-            float ang = Mathf.Atan2(dv, du);
-            part.visual.canvas.AddStamp(StampKind.Cut, uv, Mathf.Clamp01(t), halfLen, ang, 1f, Color.white, depth);
-        }
-
-        /// <summary>Paints blood that landed on the body (from the blood particle system).</summary>
+        /// <summary>Paints blood that landed on the body (from the droplet simulation).</summary>
         public void PaintBlood(BodyPart part, Vector3 world, float radius, Color c)
         {
             if (!Sandbox.Boot.blood.paintOnBodies) return;
-            Paint(part, world, StampKind.Blood, radius, 0f, 0.9f, c, 0f);
+            Paint(part, world, StampKind.Blood, radius, 0.9f, c, 0f, Vector3.zero);
             part.bloodiness = Mathf.Min(1f, part.bloodiness + 0.15f);
         }
 
+        /// <summary>Breaks a bone. Long bones (and the spine) split into two physical segments joined by a loose joint:
+        /// the skinned mesh visibly kinks there. Several fractures per limb are possible.</summary>
         public void Fracture(BodyPart part, Vector3 point, float impulse)
         {
-            if (part == null || part.fractured) return;
+            if (part == null || body.Puppet) return;
+            int id = (int)part.id;
+            if (body.FractureCount[id] >= 3) return;
+            bool splittable = PartInfo.IsLimbSegment(part.id) && part.segMax - part.segMin > 0.12f * body.Scale;
+            if (splittable)
+            {
+                float split = part.AxisCoord(point);
+                body.Skin.Fracture(part, split);
+            }
+            else if (!part.fractured)
+            {
+                // ribs, skull, pelvis, hands, feet: a crack + looser joints
+                if (part.jr != null && part.jr.joint != null) part.jr.ApplyLimits(18f);
+                body.FractureCount[id]++;
+            }
+            else return;
             part.fractured = true;
-            var vis = part.visual;
-            float t = vis != null ? Mathf.Clamp(vis.shape.TOf(vis.ToRef(point)), vis.shape.jointT0 + 0.1f, vis.shape.jointT1 - 0.1f) : 0.5f;
-            part.fractureT = t;
-            if (part.jr != null && part.jr.joint != null) { part.jr.ApplyLimits(22f); part.jr.fracturedLimits = true; }
-            for (int i = 0; i < part.children.Count; i++)
-            {
-                var c = part.children[i];
-                if (c.jr != null && c.jr.joint != null) { c.jr.ApplyLimits(28f); c.jr.fracturedLimits = true; }
-            }
-            if (vis != null && PartInfo.IsLimbSegment(part.id))
-            {
-                Vector3 axisW = part.transform.TransformDirection(vis.shape.Axis);
-                Vector3 bend = Vector3.Cross(axisW, MathUtil.SafeNormal(point - part.WorldCenter, Vector3.forward));
-                if (bend.sqrMagnitude < 1e-4f) bend = Vector3.Cross(axisW, Vector3.up);
-                vis.Kink(t, bend.normalized, rng.Range(10f, 18f));
-            }
+            Paint(part, point, StampKind.Crack, 0.035f * body.Scale, 1f, Color.white, 0f, part.transform.TransformDirection(part.segAxis));
+            Paint(part, point, StampKind.Bruise, 0.05f * body.Scale, 1f, Color.white, 0f, Vector3.zero);
             if (Sandbox.Audio != null) Sandbox.Audio.Play(Sfx.BoneCrack, point, 1f, rng.Range(0.9f, 1.15f));
             body.Vitals.AddPain(0.35f);
             body.Vitals.AddAdrenaline(0.3f);
+            body.Brain.OnPain(60f);
             if (part.id == PartId.Neck || part.id == PartId.Chest || part.id == PartId.Abdomen)
             {
-                float k = impulse / Mathf.Max(1f, PartInfo.FractureImpulse[(int)part.id] * body.MassScale);
+                float k = impulse / Mathf.Max(1f, PartInfo.FractureImpulse[id] * body.MassScale);
                 if (part.id == PartId.Neck || k > 1.4f)
                 {
-                    spinal[(int)part.id] = true;
+                    spinal[id] = true;
                     SandboxEvents.RaiseToast(part.id == PartId.Neck ? "Broken neck - paralysed" : "Spine broken - legs paralysed", new Color(1f, 0.5f, 0.3f));
-                    body.RebuildTopology();
                 }
                 if (part.id == PartId.Chest && rng.Value < 0.5f) body.Organs.DamageOrgan(rng.Value < 0.5f ? body.Organs.LungL : body.Organs.LungR, 45f);
             }
-            body.NotifyFracture(part.id);
+            if (!splittable) { body.RebuildTopology(); body.NotifyFracture(part.id); }
             if (part.attached && !body.Vitals.Dead) SandboxEvents.RaiseToast(BoneName(part.id) + " fractured", new Color(1f, 0.75f, 0.45f));
         }
 
-        static string BoneName(PartId id)
+        /// <summary>Called when the fracture mesh job finished and the bone was split.</summary>
+        public void OnFractureApplied(BodyPart s, BodyPart n, float split)
+        {
+            body.FractureCount[(int)s.id]++;
+            s.fractured = true;
+            n.fractured = true;
+            body.Wounds.MoveWounds(s, n, split);
+            body.Organs.Reassign(s, n, split);
+            if (s.jr != null && s.jr.joint != null && s.jr.kind == JointKind.Anatomical) s.jr.ApplyLimits(8f);
+            body.RebuildTopology();
+            body.NotifyFracture(s.id);
+        }
+
+        public static string BoneName(PartId id)
         {
             switch (id)
             {
@@ -1092,33 +1101,38 @@ namespace RagdollSandbox
             }
         }
 
-        /// <summary>Heal tool: restores a part (health, fractures, wounds, skin and shape).</summary>
+        /// <summary>Heal tool: restores a bone (health, wounds, set fractures rigid again, organs). Holes, cuts and
+        /// missing parts persist; a full restore respawns the body.</summary>
         public void Heal(BodyPart part)
         {
             if (part == null) return;
-            part.health = part.maxHealth;
-            part.blunt = part.cutDamage = part.pierce = part.blast = part.crush = part.shock = 0f;
-            if (part.fractured)
+            PartId id = part.id;
+            for (int i = 0; i < body.AllPieces.Count; i++)
             {
-                part.fractured = false;
-                if (part.jr != null && part.jr.joint != null) { part.jr.ApplyLimits(0f); part.jr.fracturedLimits = false; }
-                for (int i = 0; i < part.children.Count; i++)
-                    if (part.children[i].jr != null && part.children[i].jr.joint != null) { part.children[i].jr.ApplyLimits(0f); part.children[i].jr.fracturedLimits = false; }
+                var p = body.AllPieces[i];
+                if (p == null || p.id != id || !p.attached) continue;
+                p.health = p.maxHealth;
+                p.blunt = p.cutDamage = p.pierce = p.blast = p.crush = p.shock = 0f;
+                p.fractured = false;
+                if (p.jr != null && p.jr.joint != null)
+                {
+                    if (p.jr.kind == JointKind.Fracture)
+                    {
+                        // set the bone: the halves are locked together again
+                        p.jr.joint.angularXMotion = ConfigurableJointMotion.Locked;
+                        p.jr.joint.angularYMotion = ConfigurableJointMotion.Locked;
+                        p.jr.joint.angularZMotion = ConfigurableJointMotion.Locked;
+                    }
+                    else p.jr.ApplyLimits(0f);
+                }
+                body.Wounds.HealPart(p);
+                body.Organs.HealHost(p);
+                p.bloodiness = 0f;
+                body.ApplyBreakForce(p);
             }
-            if (part.id == PartId.Neck || part.id == PartId.Chest || part.id == PartId.Abdomen)
-            {
-                if (spinal[(int)part.id]) { spinal[(int)part.id] = false; body.RebuildTopology(); }
-            }
-            body.Wounds.HealPart(part);
-            body.Organs.HealHost(part);
-            if (part.visual != null)
-            {
-                part.visual.ops.Clear();
-                part.visual.Generate();
-                if (part.visual.canvas != null && !part.isPiece) part.visual.canvas.ClearAll(body.Look, 100 + (int)part.id * 13 + body.Index * 7);
-            }
-            part.bloodiness = 0f;
-            body.ApplyBreakForce(part);
+            body.FractureCount[(int)id] = 0;
+            if (id == PartId.Neck || id == PartId.Chest || id == PartId.Abdomen) spinal[(int)id] = false;
+            body.RebuildTopology();
         }
     }
     #endregion
@@ -1131,11 +1145,6 @@ namespace RagdollSandbox
 
         public DismemberSystem(RagdollBody b) { body = b; rng = new Rng(b.GetInstanceIDSafe() * 5 + 2); }
 
-        public bool IsShortened(BodyPart p)
-        {
-            return p != null && p.visual != null && p.visual.cutEnd && PartInfo.IsLimbSegment(p.id);
-        }
-
         readonly List<BodyPart> breakChecks = new List<BodyPart>(4);
 
         public void QueueBreakCheck(BodyPart part)
@@ -1143,7 +1152,7 @@ namespace RagdollSandbox
             if (part != null && !breakChecks.Contains(part)) breakChecks.Add(part);
         }
 
-        /// <summary>Severs parts whose anatomical joint was destroyed by the physics engine (break force exceeded).</summary>
+        /// <summary>Severs segments whose joint was destroyed by the physics engine (break force exceeded).</summary>
         public void ProcessBreakChecks()
         {
             for (int i = breakChecks.Count - 1; i >= 0; i--)
@@ -1155,28 +1164,31 @@ namespace RagdollSandbox
             }
         }
 
-        /// <summary>Separates 'child' (and everything below it) from its parent at their joint.</summary>
+        /// <summary>Separates 'child' (and everything below it) from its parent at their joint; the mesh is split at the
+        /// joint plane (or at the fracture for a broken bone).</summary>
         public void Sever(BodyPart child, bool fromBreak)
         {
             if (child == null || child.jr == null) return;
             BodyPart parent = child.parentPiece;
+            bool fractureJoint = child.jr.kind == JointKind.Fracture;
             if (!fromBreak && child.jr.joint != null) UnityEngine.Object.Destroy(child.jr.joint);
             child.jr.joint = null;
+            float s = body.Scale;
+            Vector3 jointPos = child.transform.TransformPoint(fractureJoint ? child.segAxis * child.segMin : Vector3.zero);
+            // mesh: separate at the joint plane (bind space)
+            if (body.Skin != null && parent != null)
+            {
+                Vector3 bindPoint = fractureJoint ? PartInfo.Origin[(int)child.id] * s + child.segAxis * child.segMin : PartInfo.Origin[(int)child.id] * s;
+                Vector3 bindNormal = fractureJoint ? child.segAxis : (PartInfo.IsFoot(child.id) ? Vector3.down : PartInfo.BoneAxis(child.id));
+                body.Skin.SeverAt(child, parent, bindPoint, bindNormal);
+            }
             if (parent != null) parent.children.Remove(child);
             child.parentPiece = null;
-            if (child.visual != null && parent != null) child.visual.ClearBlendTo(parent.transform);
-            if (parent != null && parent.visual != null) parent.visual.ClearBlendTo(child.transform);
-            Vector3 jointPos = child.rb.position;
+            child.cutOff = true;
             Vector3 outward = parent != null ? MathUtil.SafeNormal(child.WorldCenter - parent.WorldCenter, Vector3.up) : Vector3.up;
             bool wasAttached = child.attached;
-            float s = body.Scale;
-            if (parent != null)
-            {
-                body.Wounds.Add(parent, jointPos, outward, 1f, 0.05f * s, DamageType.Cut, true, true);
-                PaintStump(parent, jointPos);
-            }
+            if (parent != null) body.Wounds.Add(parent, jointPos, outward, 1f, 0.05f * s, DamageType.Cut, true, true);
             body.Wounds.Add(child, jointPos, -outward, 0.8f, 0.05f * s, DamageType.Cut, false, true);
-            PaintStump(child, jointPos);
             if (Sandbox.Fx != null && Sandbox.BloodAmount > 0f)
             {
                 Sandbox.Fx.EmitBloodSpray(jointPos, outward, 3f, 35f, 28, 0.025f, Sandbox.Boot.blood.arterial, Compat.GetVelocity(child.rb));
@@ -1187,11 +1199,7 @@ namespace RagdollSandbox
                 Sandbox.Audio.Play(Sfx.BoneCrack, jointPos, 1f, rng.Range(0.85f, 1.05f));
                 Sandbox.Audio.Play(Sfx.Squelch0, jointPos, 0.9f, rng.Range(0.9f, 1.1f));
             }
-            // torso torn apart: spill the abdominal organs
-            if (child.id == PartId.Abdomen || child.id == PartId.Chest)
-            {
-                body.Organs.Rupture(body.Part(PartId.Abdomen), jointPos, outward);
-            }
+            if (child.id == PartId.Abdomen || child.id == PartId.Chest) body.Organs.Rupture(body.Part(PartId.Abdomen), jointPos, outward);
             body.RebuildTopology();
             body.NotifySevered(child.id, child);
             if (wasAttached && !body.Vitals.Dead)
@@ -1200,45 +1208,33 @@ namespace RagdollSandbox
                 body.Vitals.AddAdrenaline(0.6f);
                 body.Brain.OnPain(80f);
             }
-            SandboxEvents.RaiseToast(SeverName(child.id), new Color(1f, 0.35f, 0.3f));
+            SandboxEvents.RaiseKill(body.Label, SeverName(child.id), new Color(1f, 0.35f, 0.3f));
         }
 
-        static string SeverName(PartId id)
+        public static string SeverName(PartId id)
         {
             switch (id)
             {
-                case PartId.Head: return "Head severed";
-                case PartId.Neck: return "Head and neck severed";
-                case PartId.Chest: return "Torso torn in half";
-                case PartId.Abdomen: return "Torso torn apart at the waist";
-                case PartId.UpperArmL: return "Left arm severed";
-                case PartId.UpperArmR: return "Right arm severed";
-                case PartId.ForearmL: return "Left forearm severed";
-                case PartId.ForearmR: return "Right forearm severed";
-                case PartId.HandL: return "Left hand severed";
-                case PartId.HandR: return "Right hand severed";
-                case PartId.ThighL: return "Left leg severed";
-                case PartId.ThighR: return "Right leg severed";
-                case PartId.ShinL: return "Left leg severed at the knee";
-                case PartId.ShinR: return "Right leg severed at the knee";
-                case PartId.FootL: return "Left foot severed";
-                default: return "Right foot severed";
+                case PartId.Head: return "head severed";
+                case PartId.Neck: return "head and neck severed";
+                case PartId.Chest: return "torso torn in half";
+                case PartId.Abdomen: return "torn apart at the waist";
+                case PartId.UpperArmL: return "left arm severed";
+                case PartId.UpperArmR: return "right arm severed";
+                case PartId.ForearmL: return "left forearm severed";
+                case PartId.ForearmR: return "right forearm severed";
+                case PartId.HandL: return "left hand severed";
+                case PartId.HandR: return "right hand severed";
+                case PartId.ThighL: return "left leg severed";
+                case PartId.ThighR: return "right leg severed";
+                case PartId.ShinL: return "left leg severed at the knee";
+                case PartId.ShinR: return "right leg severed at the knee";
+                case PartId.FootL: return "left foot severed";
+                default: return "right foot severed";
             }
         }
 
-        void PaintStump(BodyPart p, Vector3 world)
-        {
-            if (p.visual == null || Sandbox.Gore == GoreLevel.Off) return;
-            var shape = p.visual.shape;
-            float t;
-            Vector2 uv = shape.UVOf(p.visual.ToRef(world), out t);
-            float v = uv.y;
-            for (int i = 0; i < 6; i++)
-                p.visual.canvas.AddStamp(StampKind.Meat, new Vector2(i / 6f, v), Mathf.Clamp01(t), shape.MeanRadius(Mathf.Clamp01(t)) * body.Scale * 0.6f, 0f, 1f,
-                    Sandbox.Boot.blood.arterial, 0.8f);
-        }
-
-        /// <summary>Explosive dismemberment: separate the part from its parent (or its child if the part is the root).</summary>
+        /// <summary>Explosive dismemberment: separate the part from its parent.</summary>
         public void BlastSever(BodyPart part)
         {
             if (part == null || Sandbox.Gore != GoreLevel.Full) return;
@@ -1246,271 +1242,49 @@ namespace RagdollSandbox
             if (part.Joint != null) Sever(part, false);
         }
 
-        static bool RingSliceable(PartId id)
-        {
-            return PartInfo.IsLimbSegment(id) || id == PartId.Neck || (id == PartId.Abdomen && Sandbox.Boot.dismember.allowTorsoTear);
-        }
-
-        /// <summary>Blade cut through 'part' along a plane. Cuts at the closest ring, or severs at a joint near the ends.</summary>
+        /// <summary>Cuts through a segment with a plane at any point and angle (blade path / laser sweep).
+        /// The physics split and the mesh cut happen together when the (threaded) mesh job completes.</summary>
         public bool Slice(BodyPart part, Vector3 worldPoint, Vector3 planeNormal)
         {
-            if (part == null || Sandbox.Gore == GoreLevel.Off || part.visual == null) return false;
-            var vis = part.visual;
-            var shape = vis.shape;
-            Vector3 pRef = vis.ToRef(worldPoint);
-            Vector3 nRef = vis.DirToRef(planeNormal).normalized;
-            Vector3 axis = shape.Axis;
-            float len = shape.Length;
-            float denom = Vector3.Dot(axis, nRef);
-            float tc = Mathf.Abs(denom) > 0.25f ? Vector3.Dot(pRef - shape.start, nRef) / (denom * len) : shape.TOf(pRef);
-            if (!MathUtil.IsFinite(tc)) return false;
-            tc = Mathf.Clamp(tc, vis.t0, vis.t1);
-            BodyPart distalChild = null;
-            for (int i = 0; i < part.children.Count; i++)
-            {
-                var c = part.children[i];
-                if (c != null && c.Joint != null && (BodyVisuals.BlendChildOf(part.id) == c.id || part.children.Count == 1)) { distalChild = c; break; }
-            }
-            bool canProximal = part.Joint != null && part.id != PartId.Chest && part.id != PartId.Pelvis;
-            if (!RingSliceable(part.id) || part.isPiece && !RingSliceable(part.id))
-            {
-                // hands, feet, head, chest, pelvis: sever at the nearest joint
-                if (part.id == PartId.Head && part.Joint != null) { Sever(part, false); return true; }
-                if (part.id == PartId.Chest || part.id == PartId.Pelvis)
-                {
-                    // can't cut through the ribcage / pelvis bone: sever the nearest limb joint instead, if close
-                    BodyPart best = null;
-                    float bd = 0.16f * body.Scale;
-                    for (int i = 0; i < part.children.Count; i++)
-                    {
-                        var c = part.children[i];
-                        if (c == null || c.Joint == null) continue;
-                        float d = (c.rb.position - worldPoint).magnitude;
-                        if (d < bd) { bd = d; best = c; }
-                    }
-                    if (best != null) { Sever(best, false); return true; }
-                    return false;
-                }
-                if (canProximal) { Sever(part, false); return true; }
-                return false;
-            }
-            float j0 = Mathf.Max(vis.t0, shape.jointT0), j1 = Mathf.Min(vis.t1, shape.jointT1);
-            if (tc < j0 + 0.09f)
-            {
-                if (canProximal && vis.t0 <= 0.001f) { Sever(part, false); return true; }
-                tc = j0 + 0.09f;
-            }
-            if (tc > j1 - 0.07f)
-            {
-                if (distalChild != null && vis.t1 >= 0.999f) { Sever(distalChild, false); return true; }
-                tc = j1 - 0.07f;
-            }
-            if (tc <= vis.t0 + 0.05f || tc >= vis.t1 - 0.05f) return false;
-            RingCut(part, tc);
+            if (part == null || Sandbox.Gore == GoreLevel.Off || body.Skin == null || body.Puppet) return false;
+            if (!body.Skin.Slice(part, worldPoint, planeNormal)) return false;
+            if (Sandbox.Audio != null) Sandbox.Audio.Play(Sfx.Slice, worldPoint, 1f, rng.Range(0.9f, 1.1f));
+            body.LastInteractionTime = Time.time;
             return true;
         }
 
-        void RingCut(BodyPart part, float tc)
+        /// <summary>Mesh job finished: wounds on both cut faces, organs and wounds follow their side, topology.</summary>
+        public void OnMeshCut(SliceJob job, bool sever, BodyPart proximal, BodyPart distal, Vector3 capP, Vector3 capD, Vector3 bindNormal)
         {
-            var vis = part.visual;
-            var shape = vis.shape;
+            if (sever || proximal == null || distal == null) return;
             float s = body.Scale;
-            float f0 = shape.VolumeFraction(vis.t0), f1 = shape.VolumeFraction(vis.t1), fc = shape.VolumeFraction(tc);
-            float prox = Mathf.Clamp((fc - f0) / Mathf.Max(0.01f, f1 - f0), 0.1f, 0.9f);
-            float totalMass = part.rb.mass;
-            Vector3 pos = part.rb.position;
-            Quaternion rot = part.rb.rotation;
-            Vector3 vel = Compat.GetVelocity(part.rb);
-            Vector3 ang = part.rb.angularVelocity;
-
-            // New distal piece (same frame as the part, so mesh space and bind poses stay valid)
-            var go = new GameObject(PartInfo.Names[(int)part.id] + " (cut)");
-            go.transform.SetParent(body.transform, false);
-            go.transform.SetPositionAndRotation(pos, rot);
-            var piece = go.AddComponent<BodyPart>();
-            piece.id = part.id;
-            piece.body = body;
-            piece.isPiece = true;
-            piece.attached = false;
-            piece.maxHealth = part.maxHealth;
-            piece.health = part.health * 0.5f;
-            piece.fractured = part.fractured;
-            piece.baseMass = part.baseMass;
-            var rb = go.AddComponent<Rigidbody>();
-            piece.rb = rb;
-            rb.mass = Mathf.Max(0.1f, totalMass * (1f - prox));
-            Compat.SetDamping(rb, 0.05f, 0.12f);
-            rb.interpolation = RigidbodyInterpolation.Interpolate;
-            rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
-            rb.maxAngularVelocity = Sandbox.Boot.physics.maxAngularVelocity;
-            rb.maxDepenetrationVelocity = Sandbox.Boot.physics.maxDepenetrationVelocity;
-            rb.solverIterations = Sandbox.Boot.physics.solverIterations;
-            piece.col = SegmentCollider(go, part.id, shape, tc, vis.t1, s);
-            piece.col.sharedMaterial = part.col.sharedMaterial;
-            Physics.IgnoreCollision(piece.col, part.col, true);
-            Registry.Parts[piece.col] = piece;
-            Registry.PartsByBody[rb] = piece;
-            Registry.RegisterDamageable(piece.col, piece);
-
-            // Visual halves
-            piece.visual = PartVisual.CreateFrom(piece, vis, tc, vis.t1, true, vis.cutEnd);
-            Transform childBone = vis.childBone;
-            PartId childBoneId = vis.childBoneId;
-            vis.t1 = tc;
-            vis.cutEnd = true;
-            vis.childBone = null;
-            vis.childBoneId = PartId.Count;
-            vis.Generate();
-            piece.visual.SetBlend(null, PartId.Count, childBone, childBoneId);
-
-            // Reconnect the children to the distal piece
-            for (int i = 0; i < part.children.Count; i++)
-            {
-                var c = part.children[i];
-                if (c == null) continue;
-                if (c.jr != null && c.jr.joint != null)
-                {
-                    c.jr.joint.connectedBody = rb;
-                    c.jr.startLocal = Quaternion.Inverse(rot) * c.rb.rotation;
-                }
-                c.parentPiece = piece;
-                piece.children.Add(c);
-                if (c.visual != null && c.visual.parentBone == part.transform) c.visual.SetBlend(piece.transform, part.id, c.visual.childBone, c.visual.childBoneId);
-            }
-            part.children.Clear();
-
-            // Shrink the original (now a stump)
-            FitCollider(part, shape, vis.t0, tc, s);
-            part.rb.mass = Mathf.Max(0.1f, totalMass * prox);
-            rb.ResetCenterOfMass(); rb.ResetInertiaTensor();
-            part.rb.ResetCenterOfMass(); part.rb.ResetInertiaTensor();
-            ClampInertia(rb); ClampInertia(part.rb);
-            Compat.SetVelocity(rb, vel);
-            rb.angularVelocity = ang;
-
-            // Inner layers: regenerate the long bones for each half
-            SplitBones(part, piece, shape, tc);
-            body.Organs.Reassign(part, piece, shape, tc);
-            body.Wounds.MoveWounds(part, piece, tc);
-
-            Vector3 cutCenter = part.transform.TransformPoint(shape.Center(tc) * s);
-            Vector3 axisW = part.transform.TransformDirection(shape.Axis);
-            body.Wounds.Add(part, cutCenter, axisW, 1f, 0.05f * s, DamageType.Cut, PartInfo.IsLimbSegment(part.id) || part.id == PartId.Neck || part.id == PartId.Abdomen, true);
-            body.Wounds.Add(piece, cutCenter, -axisW, 0.8f, 0.05f * s, DamageType.Cut, false, true);
-            float v = shape.VOf(tc);
-            for (int i = 0; i < 8; i++)
-                vis.canvas.AddStamp(StampKind.Meat, new Vector2(i / 8f, v), tc, shape.MeanRadius(tc) * s * 0.35f, 0f, 1f, Sandbox.Boot.blood.arterial, 0.2f);
-            body.AllPieces.Add(piece);
+            float split = distal.segMin;
+            body.Organs.Reassign(proximal, distal, split);
+            body.Wounds.MoveWounds(proximal, distal, split);
+            Vector3 cP = capP.sqrMagnitude > 0f ? proximal.FromBind(capP) : proximal.transform.TransformPoint(proximal.segAxis * split);
+            Vector3 cD = capD.sqrMagnitude > 0f ? distal.FromBind(capD) : cP;
+            Vector3 axisW = proximal.transform.TransformDirection(bindNormal);
+            bool arterial = PartInfo.IsLimbSegment(proximal.id) || proximal.id == PartId.Neck || PartInfo.IsTorso(proximal.id);
+            body.Wounds.Add(proximal, cP, axisW, 1f, 0.05f * s, DamageType.Cut, arterial, true);
+            body.Wounds.Add(distal, cD, -axisW, 0.8f, 0.05f * s, DamageType.Cut, false, true);
+            Vector3 vel = Compat.GetVelocity(proximal.rb);
             if (Sandbox.Fx != null)
             {
-                Sandbox.Fx.EmitBloodSpray(cutCenter, axisW, 2.5f, 40f, 24, 0.022f, Sandbox.Boot.blood.arterial, vel);
-                Sandbox.Fx.EmitBloodSpray(cutCenter, -axisW, 2f, 40f, 14, 0.022f, Sandbox.Boot.blood.arterial, vel);
+                Sandbox.Fx.EmitBloodSpray(cP, axisW, 2.5f, 40f, 24, 0.022f, Sandbox.Boot.blood.arterial, vel);
+                Sandbox.Fx.EmitBloodSpray(cD, -axisW, 2f, 40f, 14, 0.022f, Sandbox.Boot.blood.arterial, vel);
             }
-            if (Sandbox.Audio != null)
+            if (Sandbox.Audio != null) Sandbox.Audio.Play(Sfx.Squelch1, cP, 0.8f, rng.Range(0.9f, 1.1f));
+            if (proximal.id == PartId.Abdomen || proximal.id == PartId.Chest || proximal.id == PartId.Pelvis)
             {
-                Sandbox.Audio.Play(Sfx.Slice, cutCenter, 1f, rng.Range(0.9f, 1.1f));
-                Sandbox.Audio.Play(Sfx.Squelch1, cutCenter, 0.8f, rng.Range(0.9f, 1.1f));
+                body.Organs.Rupture(proximal, cP, axisW);
+                body.Organs.Rupture(distal, cD, -axisW);
             }
-            if (part.id == PartId.Abdomen) { body.Organs.Rupture(part, cutCenter, axisW); body.Organs.Rupture(piece, cutCenter, -axisW); }
-            if (Sandbox.XRay) { piece.visual.SetXRay(true); for (int i = 0; i < piece.innerRenderers.Count; i++) piece.innerRenderers[i].enabled = true; }
+            if (proximal.id == PartId.Head && body.Organs.Brain != null) body.Organs.DamageOrgan(body.Organs.Brain, 1000f);
+            if (Sandbox.XRay) body.SetXRay(true);
             body.RebuildTopology();
-            body.NotifySevered(part.id, piece);
+            body.NotifySevered(proximal.id, distal);
             if (!body.Vitals.Dead) { body.Vitals.AddPain(0.6f); body.Vitals.AddAdrenaline(0.6f); body.Brain.OnPain(80f); }
-            SandboxEvents.RaiseToast(PartInfo.Names[(int)part.id] + " sliced", new Color(1f, 0.35f, 0.3f));
-        }
-
-        static void ClampInertia(Rigidbody rb)
-        {
-            Vector3 i = rb.inertiaTensor;
-            float m = 0.0012f;
-            rb.inertiaTensor = new Vector3(Mathf.Max(i.x, m), Mathf.Max(i.y, m), Mathf.Max(i.z, m));
-        }
-
-        static int AxisIndex(Vector3 a)
-        {
-            a = new Vector3(Mathf.Abs(a.x), Mathf.Abs(a.y), Mathf.Abs(a.z));
-            return a.x > a.y && a.x > a.z ? 0 : a.y > a.z ? 1 : 2;
-        }
-
-        static Collider SegmentCollider(GameObject go, PartId id, TubeShape shape, float t0, float t1, float s)
-        {
-            float mid = (t0 + t1) * 0.5f;
-            Vector3 c = shape.Center(mid) * s;
-            float len = (t1 - t0) * shape.Length * s;
-            if (id == PartId.Abdomen)
-            {
-                float a, b, of, os, n;
-                shape.Eval(mid, out a, out b, out of, out os, out n);
-                var box = go.AddComponent<BoxCollider>();
-                box.center = c;
-                box.size = new Vector3(a * 2f * s, Mathf.Max(0.02f, len), b * 2f * s);
-                return box;
-            }
-            var cc = go.AddComponent<CapsuleCollider>();
-            float r = shape.MeanRadius(mid) * s * 0.9f;
-            cc.direction = AxisIndex(shape.Axis);
-            cc.center = c;
-            cc.radius = r;
-            cc.height = Mathf.Max(len + r * 0.6f, r * 2f);
-            return cc;
-        }
-
-        static void FitCollider(BodyPart part, TubeShape shape, float t0, float t1, float s)
-        {
-            float mid = (t0 + t1) * 0.5f;
-            Vector3 c = shape.Center(mid) * s;
-            float len = (t1 - t0) * shape.Length * s;
-            var cap = part.col as CapsuleCollider;
-            if (cap != null)
-            {
-                if (part.id == PartId.Abdomen)
-                {
-                    float r = Mathf.Max(0.03f * s, len * 0.5f);
-                    cap.radius = Mathf.Min(cap.radius, r);
-                    cap.center = new Vector3(cap.center.x, c.y, cap.center.z);
-                }
-                else
-                {
-                    float r = Mathf.Min(cap.radius, shape.MeanRadius(mid) * s * 0.9f);
-                    cap.center = c;
-                    cap.radius = r;
-                    cap.height = Mathf.Max(len + r * 0.6f, r * 2f);
-                }
-            }
-            var box = part.col as BoxCollider;
-            if (box != null)
-            {
-                box.center = c;
-                Vector3 sz = box.size;
-                int ax = AxisIndex(shape.Axis);
-                sz[ax] = Mathf.Max(0.02f, len);
-                box.size = sz;
-            }
-        }
-
-        void SplitBones(BodyPart part, BodyPart piece, TubeShape shape, float tc)
-        {
-            // Hide the full-length inner meshes on the stump and build per-half long bones
-            Transform inner = part.transform.Find("Inner");
-            float boneLen = (PartInfo.Tip[(int)part.id] - PartInfo.Origin[(int)part.id]).magnitude;
-            Vector3 cutRef = shape.start + shape.Axis * (tc * shape.Length);
-            float tb = Mathf.Clamp01(cutRef.magnitude / Mathf.Max(0.01f, boneLen));
-            for (int i = 0; i < part.innerRenderers.Count; i++)
-            {
-                var r = part.innerRenderers[i];
-                if (r != null && r.name == "Bones") { UnityEngine.Object.Destroy(r.gameObject); part.innerRenderers.RemoveAt(i); i--; }
-            }
-            var pieceInner = new GameObject("Inner");
-            pieceInner.transform.SetParent(piece.transform, false);
-            pieceInner.transform.localScale = Vector3.one * body.Scale;
-            if (inner != null)
-            {
-                float prevA = 0f;
-                var m0 = BodyMeshLibrary.LongBoneMesh(part.id, prevA, tb);
-                if (m0 != null) BodyVisuals.AddInner(part, inner, m0, MaterialFactory.Bone, "Bones").enabled = Sandbox.XRay;
-            }
-            var m1 = BodyMeshLibrary.LongBoneMesh(part.id, tb, 1f);
-            if (m1 != null) BodyVisuals.AddInner(piece, pieceInner.transform, m1, MaterialFactory.Bone, "Bones").enabled = Sandbox.XRay;
+            SandboxEvents.RaiseKill(body.Label, PartInfo.Short[(int)proximal.id] + " sliced", new Color(1f, 0.35f, 0.3f));
         }
     }
     #endregion

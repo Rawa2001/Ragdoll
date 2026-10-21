@@ -1,14 +1,16 @@
-// Ragdoll Sandbox - active ragdoll motor control.
-//  * Pose / IKSolver: procedural target poses and analytic two-bone IK. IK never moves transforms: it only
-//    produces joint target rotations that the muscles (slerp drives) must physically reach.
-//  * MuscleController: per-joint strength (health, consciousness, oxygen, fatigue, death fade), reflexes, spasms.
-//  * BalanceController: centre of mass, support polygon, capture point, upright PD and pelvis height regulation
-//    applied as internal force/torque pairs between torso and stance feet (ground reaction), plus a small bounded
-//    assist torque that scales with consciousness.
-//  * LocomotionController: per-foot Stance -> Lift -> Swing -> Plant state machine with capture-point footholds,
-//    Bezier swing arcs, toe-off push, slip/trip handling, walk/run/jump/crouch.
-//  * MotorBrain: behaviour states (stand, fall, lie, get up, crawl, hop, headless, unconscious, dead), possession,
-//    reactions (flinch, shield head, clutch wounds), gaze and breathing.
+// Ragdoll Sandbox - active ragdoll motor control (no Animator).
+//  * Pose / IKSolver: procedural target poses and analytic two-bone IK. IK only produces joint target rotations that
+//    the muscles (slerp drives) must physically reach.
+//  * MuscleController: per-joint strength (health, consciousness, oxygen, fatigue, death fade), reflexes, spasms,
+//    and a weighted layer stack so behaviours blend smoothly instead of switching.
+//  * BalanceController: centre of mass, support polygon, capture point, ground sensing, plus the bounded assist:
+//    implicit (joint-drive) upright torques on pelvis and chest, pelvis height support and velocity tracking forces.
+//    All assists scale with consciousness, damage and the behaviour's control weight, and fade out when falling.
+//  * LocomotionController: per-foot Stance -> Lift -> Swing -> Plant state machine, capture-point / Raibert footholds,
+//    Bezier swing arcs with obstacle clearance, toe-off push, foot locking, recovery steps, run/jump/crouch/hop/turn.
+//  * MotorBrain: behaviour states (stand, fall, lie, get up, crawl, hop, headless, unconscious, dead), possession and
+//    Euphoria-style weighted reactions: stagger, brace, protect head, grab-and-hold, clutch wounds, hunch, limp,
+//    hold head, struggle, vehicle hits with flailing.
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -134,6 +136,8 @@ namespace RagdollSandbox
         public readonly Quaternion[] target = new Quaternion[PartInfo.Count];
         public readonly float[] poseStiffness = new float[PartInfo.Count];
         public readonly float[] strength = new float[PartInfo.Count];
+        /// <summary>Drive load of each joint (0..1+, spring torque demand / torque limit) for the debug overlay.</summary>
+        public readonly float[] load = new float[PartInfo.Count];
         public float ActiveLevel = 1f;
         public float DeathFade = 1f;
         public float Brace;            // co-contraction (0..1)
@@ -141,6 +145,8 @@ namespace RagdollSandbox
         public float SpasmAmount;      // random joint noise (shock, headless, dying)
         public float FlinchTimer;
         public float GlobalScale = 1f; // behaviour-level strength (falling limp, relaxed lying)
+        public float LegScaleL = 1f, LegScaleR = 1f; // limp / swing leg softness
+        public float Tone = 1f;        // smoothed global tone (so behaviour changes never pop)
         float twitchTime = -1f;
         bool twitched;
         readonly Vector3[] spasmTarget = new Vector3[PartInfo.Count];
@@ -166,17 +172,27 @@ namespace RagdollSandbox
 
         public void OnTopologyChanged() { }
 
+        /// <summary>Base layer: sets the joint target outright.</summary>
         public void Set(PartId id, Quaternion local, float stiffness = 1f)
         {
             target[(int)id] = local;
             poseStiffness[(int)id] = stiffness;
         }
 
+        /// <summary>Overlay layer: blends toward 'local' with weight w (0..1). Layers applied later win.</summary>
+        public void Blend(PartId id, Quaternion local, float w, float stiffness = 1f)
+        {
+            if (w <= 0.001f) return;
+            int i = (int)id;
+            w = Mathf.Clamp01(w);
+            target[i] = Quaternion.Slerp(target[i], local, w);
+            poseStiffness[i] = Mathf.Lerp(poseStiffness[i], stiffness, w);
+        }
+
         public void Apply(float dt)
         {
             var ms = Sandbox.Boot.muscles;
             var vit = body.Vitals;
-            // Active level from consciousness (or the UI override).
             float c = vit.Consciousness;
             float auto = c > 0.55f ? 1f : c > 0.25f ? Mathf.Lerp(ms.unconsciousTone, 1f, (c - 0.25f) / 0.3f) : ms.unconsciousTone;
             if (!body.BrainPresent && !vit.Dead) auto = Mathf.Max(auto, vit.HeadlessDrive);
@@ -191,11 +207,13 @@ namespace RagdollSandbox
 
             if (Stun > 0f) Stun -= dt;
             if (FlinchTimer > 0f) FlinchTimer -= dt;
-            float stunMul = Stun > 0f ? 0.3f : 1f;
+            float stunMul = Stun > 0f ? 0.35f : 1f;
             float brace = Mathf.Clamp01(Brace + (FlinchTimer > 0f ? 0.8f : 0f));
             float stiffMul = Mathf.Lerp(1f, ms.coContraction, brace);
             float vitalsMul = vit.MuscleFactor;
-            float global = ms.strength * ActiveLevel * DeathFade * vitalsMul * stunMul * GlobalScale;
+            float targetTone = ms.strength * ActiveLevel * DeathFade * vitalsMul * stunMul * GlobalScale;
+            Tone = Mathf.MoveTowards(Tone, targetTone, dt * (targetTone < Tone ? 6f : 3f));
+            float global = Tone;
 
             UpdateSpasm(dt);
 
@@ -204,28 +222,40 @@ namespace RagdollSandbox
                 var p = body.AllPieces[i];
                 if (p == null || p.jr == null || p.jr.joint == null) continue;
                 var j = p.jr.joint;
-                int id = (int)p.id;
-                bool motor = p.attached && !p.isPiece && !p.paralyzed && global > 0.001f;
-                if (p.isPiece || !p.attached)
+                if (p.jr.kind == JointKind.Fracture)
                 {
-                    j.slerpDrive = new JointDrive { positionSpring = 0f, positionDamper = 1.5f * body.MassScale, maximumForce = 1000f };
+                    // the two halves of a broken bone: barely held, very floppy
+                    float k = 18f * body.MassScale * Mathf.Clamp01(global);
+                    j.slerpDrive = new JointDrive { positionSpring = k, positionDamper = 2.5f * body.MassScale, maximumForce = 40f * body.MassScale };
+                    j.targetRotation = Quaternion.identity;
                     continue;
                 }
+                int id = (int)p.id;
+                if (p.isPiece || !p.attached)
+                {
+                    j.slerpDrive = new JointDrive { positionSpring = 0f, positionDamper = 1.2f * body.MassScale, maximumForce = 1000f };
+                    load[id] = 0f;
+                    continue;
+                }
+                bool motor = !p.paralyzed && global > 0.001f;
                 float s = 0f;
                 if (motor)
                 {
-                    float health = Mathf.Lerp(0.25f, 1f, Mathf.Min(p.HealthFraction, p.parentPiece != null ? Mathf.Lerp(0.4f, 1f, p.parentPiece.HealthFraction) : 1f));
-                    float frac = (p.fractured ? 0.22f : 1f) * (p.parentPiece != null && p.parentPiece.fractured ? 0.45f : 1f);
+                    float health = Mathf.Lerp(0.3f, 1f, Mathf.Min(p.HealthFraction, p.parentPiece != null ? Mathf.Lerp(0.4f, 1f, p.parentPiece.HealthFraction) : 1f));
+                    int fr = body.FractureCount[id] + (p.parentPiece != null ? body.FractureCount[(int)p.parentPiece.id] : 0);
+                    float frac = fr > 0 ? Mathf.Pow(0.4f, fr) : 1f;
                     float fatigue = 1f - vit.Fatigue * 0.45f;
                     s = global * health * frac * fatigue * poseStiffness[id];
+                    int leg = PartInfo.LegSide(p.id);
+                    if (leg == 0) s *= LegScaleL; else if (leg == 1) s *= LegScaleR;
                 }
                 strength[id] = s;
                 float spring, damper, maxT;
                 GroupGains(p.jr.group, ms, out spring, out damper, out maxT);
                 float springK = spring * s * stiffMul * body.MassScale;
-                float damperK = damper * (0.25f + 0.75f * Mathf.Min(1f, s)) * Mathf.Sqrt(stiffMul) * body.MassScale;
-                if (!motor) { springK = 0f; damperK = damper * 0.06f * body.MassScale; }
-                float maxF = Mathf.Max(5f, maxT * Mathf.Max(s, 0.05f) * ms.torqueLimitScale * stiffMul * body.MassScale);
+                float damperK = damper * (0.3f + 0.7f * Mathf.Min(1f, s)) * Mathf.Sqrt(stiffMul) * body.MassScale;
+                if (!motor) { springK = 0f; damperK = damper * 0.05f * body.MassScale; }
+                float maxF = Mathf.Max(4f, maxT * Mathf.Max(s, 0.04f) * ms.torqueLimitScale * stiffMul * body.MassScale);
                 j.slerpDrive = new JointDrive { positionSpring = springK, positionDamper = damperK, maximumForce = maxF };
                 Quaternion t = target[id];
                 if (SpasmAmount > 0.01f)
@@ -234,6 +264,14 @@ namespace RagdollSandbox
                     t = t * Quaternion.Euler(e);
                 }
                 if (MathUtil.IsFinite(t)) j.targetRotation = p.jr.ToJointSpace(t);
+                // load = how much of the drive's torque budget the current error demands
+                if (p.parentPiece != null && springK > 0f)
+                {
+                    Quaternion cur = Quaternion.Inverse(p.parentPiece.rb.rotation) * p.rb.rotation;
+                    float err = Quaternion.Angle(cur, t) * Mathf.Deg2Rad;
+                    load[id] = springK * err / Mathf.Max(1f, maxF);
+                }
+                else load[id] = 0f;
             }
         }
 
@@ -255,15 +293,15 @@ namespace RagdollSandbox
         {
             switch (g)
             {
-                case MuscleGroup.Spine: spring = ms.spineSpring; damper = ms.spineDamper; maxTorque = 700f; break;
-                case MuscleGroup.Neck: spring = ms.neckSpring; damper = ms.neckDamper; maxTorque = 170f; break;
-                case MuscleGroup.Head: spring = ms.neckSpring * 0.7f; damper = ms.neckDamper * 0.7f; maxTorque = 110f; break;
-                case MuscleGroup.Shoulder: spring = ms.shoulderSpring; damper = ms.shoulderDamper; maxTorque = 230f; break;
-                case MuscleGroup.Elbow: spring = ms.elbowSpring; damper = ms.elbowDamper; maxTorque = 140f; break;
-                case MuscleGroup.Wrist: spring = ms.wristSpring; damper = ms.wristDamper; maxTorque = 45f; break;
-                case MuscleGroup.Hip: spring = ms.hipSpring; damper = ms.hipDamper; maxTorque = 950f; break;
-                case MuscleGroup.Knee: spring = ms.kneeSpring; damper = ms.kneeDamper; maxTorque = 900f; break;
-                case MuscleGroup.Ankle: spring = ms.ankleSpring; damper = ms.ankleDamper; maxTorque = 480f; break;
+                case MuscleGroup.Spine: spring = ms.spineSpring; damper = ms.spineDamper; maxTorque = 650f; break;
+                case MuscleGroup.Neck: spring = ms.neckSpring; damper = ms.neckDamper; maxTorque = 150f; break;
+                case MuscleGroup.Head: spring = ms.neckSpring * 0.7f; damper = ms.neckDamper * 0.7f; maxTorque = 100f; break;
+                case MuscleGroup.Shoulder: spring = ms.shoulderSpring; damper = ms.shoulderDamper; maxTorque = 220f; break;
+                case MuscleGroup.Elbow: spring = ms.elbowSpring; damper = ms.elbowDamper; maxTorque = 130f; break;
+                case MuscleGroup.Wrist: spring = ms.wristSpring; damper = ms.wristDamper; maxTorque = 40f; break;
+                case MuscleGroup.Hip: spring = ms.hipSpring; damper = ms.hipDamper; maxTorque = 900f; break;
+                case MuscleGroup.Knee: spring = ms.kneeSpring; damper = ms.kneeDamper; maxTorque = 850f; break;
+                case MuscleGroup.Ankle: spring = ms.ankleSpring; damper = ms.ankleDamper; maxTorque = 420f; break;
                 default: spring = 0f; damper = 2f; maxTorque = 50f; break;
             }
         }
@@ -284,7 +322,7 @@ namespace RagdollSandbox
 
         public void Flinch(float amount)
         {
-            float k = Sandbox.Boot.muscles.reflexStrength;
+            float k = Sandbox.Boot.muscles.reflexStrength * Sandbox.Boot.behaviour.reactionStrength;
             if (k <= 0f) return;
             FlinchTimer = Mathf.Max(FlinchTimer, 0.12f + 0.15f * Mathf.Clamp01(amount) * k);
         }
@@ -305,10 +343,30 @@ namespace RagdollSandbox
             if (!ids.TryGetValue(o, out id)) { id = counter++; ids[o] = id; }
             return id;
         }
+        public static void Clear() { ids.Clear(); }
     }
     #endregion
 
     #region BalanceController
+    /// <summary>What the behaviour layer asks the balance assist to do this physics step.</summary>
+    public struct BalanceCommand
+    {
+        public float control;           // 0..1 overall assist weight (fades in/out with behaviours)
+        public Quaternion pelvisTarget, chestTarget;
+        public float upright;           // 0..1 upright torque weight
+        public float chestUpright;
+        public float heightTarget;      // world y of the pelvis centre of mass
+        public float lift;              // fraction of the supported weight carried by the assist (0..1.2)
+        public float heightWeight;      // weight of the height PD term
+        public Vector3 velocityTarget;  // horizontal
+        public float velocityWeight;
+        public Vector3 centerTarget;    // horizontal position the COM should stay over (standing)
+        public float centerWeight;
+        public Vector3 extraForce;      // one-off forces (jump)
+        public float liftChest;         // extra lift on the chest (get up, push-up)
+        public float chestHeightTarget;
+    }
+
     public class BalanceController
     {
         readonly RagdollBody body;
@@ -325,22 +383,108 @@ namespace RagdollSandbox
         public Vector3 SupportCenter;
         public int SupportCount;
         public float SupportDistance;   // signed distance of the capture point outside the support polygon
+        public float ComSupportDistance;// signed distance of the COM ground projection outside the support polygon
         public readonly bool[] FootGrounded = new bool[2];
+        public readonly bool[] FootNearGround = new bool[2];
         public readonly BodyPart[] FootPart = new BodyPart[2];
         public readonly Vector3[] SolePos = new Vector3[2];
         public readonly Vector3[] FootFwd = new Vector3[2];
-        public float AssistBudget;
+        public readonly float[] FootGroundY = new float[2];
+        public readonly Vector3[] FootGroundN = new Vector3[2];
         public float UprightDot;        // chest up . world up
+        public float HealthFactor = 1f;
+        public BalanceCommand Cmd;
+        public float AppliedTorqueFraction, AppliedLift, AppliedHorizontal;   // debug read-outs
+        public readonly Vector2[] Hull = new Vector2[17];
+        public int HullCount;
 
         readonly RaycastHit[] hits = new RaycastHit[16];
         readonly Vector2[] hullIn = new Vector2[8];
-        readonly Vector2[] hullOut = new Vector2[17];
-        int hullCount;
+        ConfigurableJoint pelvisAnchor, chestAnchor;
+        Quaternion pelvisStart = Quaternion.identity, chestStart = Quaternion.identity;
+        Rigidbody pelvisAnchorRb, chestAnchorRb;
+        bool enabledAssist = true;
+        float smoothControl;
 
         public BalanceController(RagdollBody b) { body = b; }
 
         public float StandHeight { get { return Sandbox.Boot.balance.standHeightRatio * PartInfo.RefHeight * body.Scale; } }
         public float G { get { return Physics.gravity.magnitude; } }
+        public float Control { get { return smoothControl; } }
+
+        /// <summary>Creates the two invisible "world" joints whose implicit slerp drives provide the bounded upright
+        /// assist (PhysX solves drives implicitly, so they stay stable at any stiffness unlike explicit PD torques).</summary>
+        public void Init()
+        {
+            CreateAnchors();
+        }
+
+        void CreateAnchors()
+        {
+            DestroyAnchors();
+            if (body.Pelvis != null) pelvisAnchor = MakeAnchor(body.Pelvis, out pelvisStart, out pelvisAnchorRb);
+            if (body.Chest != null) chestAnchor = MakeAnchor(body.Chest, out chestStart, out chestAnchorRb);
+        }
+
+        ConfigurableJoint MakeAnchor(BodyPart part, out Quaternion start, out Rigidbody anchorBody)
+        {
+            var j = part.gameObject.AddComponent<ConfigurableJoint>();
+            j.autoConfigureConnectedAnchor = false;
+            j.anchor = Vector3.zero;
+            j.axis = Vector3.right;
+            j.secondaryAxis = Vector3.up;
+            j.connectedBody = null;
+            j.connectedAnchor = part.rb.position;
+            j.xMotion = ConfigurableJointMotion.Free;
+            j.yMotion = ConfigurableJointMotion.Free;
+            j.zMotion = ConfigurableJointMotion.Free;
+            j.angularXMotion = ConfigurableJointMotion.Free;
+            j.angularYMotion = ConfigurableJointMotion.Free;
+            j.angularZMotion = ConfigurableJointMotion.Free;
+            j.rotationDriveMode = RotationDriveMode.Slerp;
+            j.slerpDrive = new JointDrive { positionSpring = 0f, positionDamper = 0f, maximumForce = 0f };
+            j.enablePreprocessing = false;
+            j.enableCollision = true;
+            j.breakForce = Mathf.Infinity;
+            j.breakTorque = Mathf.Infinity;
+            start = part.rb.rotation;
+            anchorBody = part.rb;
+            return j;
+        }
+
+        void DestroyAnchors()
+        {
+            if (pelvisAnchor != null) UnityEngine.Object.Destroy(pelvisAnchor);
+            if (chestAnchor != null) UnityEngine.Object.Destroy(chestAnchor);
+            pelvisAnchor = null; chestAnchor = null;
+        }
+
+        public void SetEnabled(bool on)
+        {
+            enabledAssist = on;
+            if (!on) { Release(pelvisAnchor); Release(chestAnchor); }
+        }
+
+        public void Dispose() { DestroyAnchors(); }
+
+        public void OnTopologyChanged()
+        {
+            // the anchors stay on the primary pelvis/chest segments; nothing to rebuild unless they vanished
+            if ((pelvisAnchor == null && body.Pelvis != null) || (chestAnchor == null && body.Chest != null)) CreateAnchors();
+        }
+
+        static void Release(ConfigurableJoint j)
+        {
+            if (j == null) return;
+            j.slerpDrive = new JointDrive { positionSpring = 0f, positionDamper = 0f, maximumForce = 0f };
+        }
+
+        public void ClearCommand()
+        {
+            var p = body.Pelvis;
+            Quaternion r = p != null ? p.rb.rotation : Quaternion.identity;
+            Cmd = new BalanceCommand { pelvisTarget = r, chestTarget = r };
+        }
 
         public void Sense(float dt)
         {
@@ -360,20 +504,33 @@ namespace RagdollSandbox
             {
                 PartId foot = side == 0 ? PartId.FootL : PartId.FootR;
                 PartId shin = side == 0 ? PartId.ShinL : PartId.ShinR;
-                BodyPart fp = body.LegUsable[side] ? (body.LegHasFoot[side] ? body.Part(foot) : body.Part(shin)) : null;
+                BodyPart fp = body.LegPresent[side] ? (body.LegHasFoot[side] ? body.Part(foot) : body.DistalOf(shin)) : null;
+                if (fp != null && !fp.attached) fp = null;
                 FootPart[side] = fp;
                 FootGrounded[side] = false;
+                FootNearGround[side] = false;
                 if (fp == null) continue;
                 Quaternion r = fp.rb.rotation;
-                if (fp.id == foot) SolePos[side] = fp.rb.position + r * (new Vector3(0f, -0.075f, 0.065f) * s);
-                else SolePos[side] = fp.rb.position + r * (new Vector3(0f, -0.4f, 0f) * s);
+                if (fp.id == foot) SolePos[side] = fp.rb.position + r * (new Vector3(0f, -0.072f, 0.065f) * s);
+                else SolePos[side] = fp.transform.TransformPoint(fp.segAxis * fp.segMax);
                 FootFwd[side] = MathUtil.SafeNormal(MathUtil.Flat(fp.id == foot ? r * Vector3.forward : pelvis.rb.rotation * Vector3.forward), Vector3.forward);
-                if (fp.Grounded)
+                bool contact = fp.Grounded;
+                RaycastHit hit;
+                float gy = SolePos[side].y;
+                Vector3 gnrm = Vector3.up;
+                bool ray = Ground(SolePos[side] + Vector3.up * 0.08f * s, 0.22f * s, out hit);
+                if (ray) { gy = hit.point.y; gnrm = hit.normal; }
+                else if (contact) { gy = fp.groundPoint.y; gnrm = fp.groundNormal; }
+                FootGroundY[side] = gy;
+                FootGroundN[side] = gnrm;
+                float gap = SolePos[side].y - gy;
+                FootNearGround[side] = ray && gap < 0.08f * s;
+                if (contact || (ray && gap < 0.03f * s))
                 {
                     FootGrounded[side] = true;
                     SupportCount++;
                     sc += SolePos[side];
-                    groundSum += fp.groundPoint.y;
+                    groundSum += gy;
                     gn++;
                 }
             }
@@ -396,20 +553,27 @@ namespace RagdollSandbox
             Omega = Mathf.Sqrt(g / ComHeight);
             Vector3 v = MathUtil.Flat(body.ComVelocity);
             CapturePoint = MathUtil.Flat(body.CenterOfMass) + v / Omega;
-            SupportDistance = SupportCount > 0 ? DistanceOutsideSupport(CapturePoint) : 10f;
+            BuildHull();
+            SupportDistance = HullCount > 0 ? DistanceOutsideHull(CapturePoint) : 10f;
+            ComSupportDistance = HullCount > 0 ? DistanceOutsideHull(body.CenterOfMass) : 10f;
             Upright = Tilt < Sandbox.Boot.balance.fallAngle && PelvisHeight > StandHeight * 0.55f;
             float health = 0f;
             int hn = 0;
-            for (int i = 0; i < body.AttachedParts.Count; i++) { health += body.AttachedParts[i].HealthFraction; hn++; }
+            for (int i = 0; i < body.AttachedParts.Count; i++)
+            {
+                var p = body.AttachedParts[i];
+                if (PartInfo.IsArm(p.id)) continue;
+                health += p.HealthFraction; hn++;
+            }
             health = hn > 0 ? health / hn : 0f;
-            AssistBudget = Sandbox.Boot.balance.assistTorque * Mathf.Clamp01(body.Vitals.Consciousness) * Mathf.Lerp(0.2f, 1f, health) * body.Muscles.DeathFade;
+            HealthFactor = Mathf.Lerp(0.35f, 1f, health);
         }
 
-        /// <summary>Raycasts down for walkable ground, ignoring this ragdoll's own colliders and triggers.</summary>
+        /// <summary>Raycasts down for walkable ground, ignoring this ragdoll's own colliders, organs and triggers.</summary>
         public bool Ground(Vector3 from, float maxDist, out RaycastHit best)
         {
             best = new RaycastHit();
-            int n = Physics.RaycastNonAlloc(from + Vector3.up * 0.05f, Vector3.down, hits, maxDist, ~0, QueryTriggerInteraction.Ignore);
+            int n = Physics.RaycastNonAlloc(from, Vector3.down, hits, maxDist, Layers.GroundMask, QueryTriggerInteraction.Ignore);
             float bd = float.MaxValue;
             bool found = false;
             for (int i = 0; i < n; i++)
@@ -417,15 +581,13 @@ namespace RagdollSandbox
                 var h = hits[i];
                 BodyPart bp = Registry.PartOf(h.collider);
                 if (bp != null && bp.body == body) continue;
-                Organ og;
-                if (Registry.Organs.TryGetValue(h.collider, out og)) continue;
+                if (Registry.Organs.ContainsKey(h.collider)) continue;
                 if (h.distance < bd) { bd = h.distance; best = h; found = true; }
             }
             return found;
         }
 
-        /// <summary>Signed distance from p (XZ) to the support polygon built from grounded feet (negative inside).</summary>
-        public float DistanceOutsideSupport(Vector3 p)
+        void BuildHull()
         {
             float s = body.Scale;
             int k = 0;
@@ -435,21 +597,28 @@ namespace RagdollSandbox
                 Vector3 c = SolePos[side];
                 Vector3 f = FootFwd[side];
                 Vector3 r = new Vector3(f.z, 0f, -f.x);
-                float hl = (FootPart[side] != null && (FootPart[side].id == PartId.FootL || FootPart[side].id == PartId.FootR) ? 0.125f : 0.04f) * s;
-                float hw = 0.045f * s;
+                bool isFoot = FootPart[side] != null && PartInfo.IsFoot(FootPart[side].id);
+                float hl = (isFoot ? 0.12f : 0.035f) * s;
+                float hw = (isFoot ? 0.045f : 0.035f) * s;
                 hullIn[k++] = new Vector2(c.x + f.x * hl + r.x * hw, c.z + f.z * hl + r.z * hw);
                 hullIn[k++] = new Vector2(c.x + f.x * hl - r.x * hw, c.z + f.z * hl - r.z * hw);
                 hullIn[k++] = new Vector2(c.x - f.x * hl + r.x * hw, c.z - f.z * hl + r.z * hw);
                 hullIn[k++] = new Vector2(c.x - f.x * hl - r.x * hw, c.z - f.z * hl - r.z * hw);
             }
-            if (k == 0) return 10f;
+            if (k == 0) { HullCount = 0; return; }
             ConvexHull(k);
+        }
+
+        /// <summary>Signed distance from p (XZ) to the support polygon built from grounded feet (negative inside).</summary>
+        public float DistanceOutsideHull(Vector3 p)
+        {
+            if (HullCount == 0) return 10f;
             Vector2 q = new Vector2(p.x, p.z);
             bool inside = true;
             float minDist = float.MaxValue;
-            for (int i = 0; i < hullCount; i++)
+            for (int i = 0; i < HullCount; i++)
             {
-                Vector2 a = hullOut[i], b = hullOut[(i + 1) % hullCount];
+                Vector2 a = Hull[i], b = Hull[(i + 1) % HullCount];
                 Vector2 e = b - a;
                 float cross = e.x * (q.y - a.y) - e.y * (q.x - a.x);
                 if (cross < 0f) inside = false;
@@ -462,7 +631,6 @@ namespace RagdollSandbox
 
         void ConvexHull(int n)
         {
-            // insertion sort by x then y (n <= 8)
             for (int i = 1; i < n; i++)
             {
                 Vector2 key = hullIn[i];
@@ -473,15 +641,15 @@ namespace RagdollSandbox
             int k = 0;
             for (int i = 0; i < n; i++)
             {
-                while (k >= 2 && Cross(hullOut[k - 2], hullOut[k - 1], hullIn[i]) <= 0f) k--;
-                hullOut[k++] = hullIn[i];
+                while (k >= 2 && Cross(Hull[k - 2], Hull[k - 1], hullIn[i]) <= 0f) k--;
+                Hull[k++] = hullIn[i];
             }
             for (int i = n - 2, t = k + 1; i >= 0; i--)
             {
-                while (k >= t && Cross(hullOut[k - 2], hullOut[k - 1], hullIn[i]) <= 0f) k--;
-                hullOut[k++] = hullIn[i];
+                while (k >= t && Cross(Hull[k - 2], Hull[k - 1], hullIn[i]) <= 0f) k--;
+                Hull[k++] = hullIn[i];
             }
-            hullCount = Mathf.Max(1, k - 1);
+            HullCount = Mathf.Max(1, k - 1);
         }
 
         static float Cross(Vector2 o, Vector2 a, Vector2 b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); }
@@ -500,107 +668,108 @@ namespace RagdollSandbox
             b.AddForce(-impulseOnA, ForceMode.Impulse);
         }
 
-        /// <summary>PD torque toward 'target'. Explicit torques are clamped by the body's own inertia so they stay
-        /// numerically stable at the fixed timestep; the stiff posture itself comes from the implicit joint drives.</summary>
-        public static Vector3 UprightTorque(Rigidbody rb, Quaternion target, float kp, float kd)
+        /// <summary>Mass of leg segments whose foot is on the ground (they are carried by the ground, not the assist).</summary>
+        float StanceLegMass()
         {
-            Vector3 err = MathUtil.RotationError(rb.rotation, target);
-            Vector3 inertia = rb.inertiaTensor;
-            float imin = Mathf.Max(1e-4f, Mathf.Min(inertia.x, Mathf.Min(inertia.y, inertia.z)));
-            float dt = Mathf.Max(0.002f, Time.fixedDeltaTime);
-            float kpMax = 0.45f * imin / (dt * dt);
-            float kdMax = 0.5f * imin / dt;
-            return err * Mathf.Min(kp, kpMax) - rb.angularVelocity * Mathf.Min(kd, kdMax);
+            float m = 0f;
+            for (int i = 0; i < body.AttachedParts.Count; i++)
+            {
+                var p = body.AttachedParts[i];
+                int leg = PartInfo.LegSide(p.id);
+                if (leg >= 0 && FootGrounded[leg]) m += p.rb.mass;
+            }
+            return m;
         }
 
-        /// <summary>Bounded external assist torque (scales with consciousness, fades with damage).</summary>
-        public void Assist(Rigidbody rb, Vector3 torque, float scale = 1f)
-        {
-            float max = AssistBudget * scale;
-            if (max <= 0f || rb == null) return;
-            if (torque.magnitude > max) torque = torque.normalized * max;
-            if (MathUtil.IsFinite(torque)) rb.AddTorque(torque, ForceMode.Force);
-        }
-
-        /// <summary>Applies the stance support: pelvis height, COM tracking and upright torques, with reactions on the
-        /// stance feet (friction- and ankle-capacity-limited) and a bounded assist for the remainder.</summary>
-        public void Support(float heightTarget, Vector3 comTargetXZ, bool usePosition, Vector3 velTargetXZ, Quaternion pelvisTarget, Quaternion chestTarget,
-            float legStrength, float uprightScale, float extraLift)
+        /// <summary>Applies the command: implicit upright drives, bounded support and velocity forces.</summary>
+        public void ApplyAssist(float dt)
         {
             var bs = Sandbox.Boot.balance;
             var pelvis = body.Pelvis;
             var chest = body.Chest;
-            if (pelvis == null || SupportCount == 0) return;
+            if (pelvis == null || !enabledAssist) return;
+            float consciousness = Mathf.Clamp01(body.Vitals.Consciousness * 1.25f);
+            float alive = body.Muscles.DeathFade;
+            float c = Mathf.Clamp01(Cmd.control);
+            smoothControl = Mathf.MoveTowards(smoothControl, c, dt * (c < smoothControl ? 5f : 2.5f));
+            float k = smoothControl * consciousness * alive * HealthFactor;
+            if (body.Vitals.Dead || !MathUtil.IsFinite(Cmd.pelvisTarget)) k = 0f;
+            float ms = body.MassScale;
+
+            // 1) upright: implicit slerp drives to the world (bounded by maximumForce = the assist budget)
+            float budget = bs.assistTorque * ms * k * Mathf.Clamp01(Cmd.upright);
+            AppliedTorqueFraction = bs.assistTorque > 0f ? budget / (bs.assistTorque * ms) : 0f;
+            if (pelvisAnchor != null && pelvis.attached)
+            {
+                pelvisAnchor.slerpDrive = new JointDrive
+                {
+                    positionSpring = bs.pelvisUprightSpring * ms * (budget > 0f ? 1f : 0f),
+                    positionDamper = bs.pelvisUprightDamper * ms * (budget > 0f ? 1f : 0f),
+                    maximumForce = budget
+                };
+                pelvisAnchor.targetRotation = Quaternion.Inverse(Cmd.pelvisTarget) * pelvisStart;
+            }
+            else Release(pelvisAnchor);
+            float chestBudget = bs.assistTorque * bs.chestAssistRatio * ms * k * Mathf.Clamp01(Cmd.chestUpright);
+            if (chestAnchor != null && chest != null && chest.attached && MathUtil.IsFinite(Cmd.chestTarget))
+            {
+                chestAnchor.slerpDrive = new JointDrive
+                {
+                    positionSpring = bs.chestUprightSpring * ms * (chestBudget > 0f ? 1f : 0f),
+                    positionDamper = bs.chestUprightDamper * ms * (chestBudget > 0f ? 1f : 0f),
+                    maximumForce = chestBudget
+                };
+                chestAnchor.targetRotation = Quaternion.Inverse(Cmd.chestTarget) * chestStart;
+            }
+            else Release(chestAnchor);
+            if (k <= 0.0001f) { AppliedLift = 0f; AppliedHorizontal = 0f; return; }
+
             float g = G;
             float mass = body.TotalMass;
-            float legMass = 0f;
-            for (int side = 0; side < 2; side++)
-            {
-                if (!FootGrounded[side]) continue;
-                PartId thigh = side == 0 ? PartId.ThighL : PartId.ThighR, shin = side == 0 ? PartId.ShinL : PartId.ShinR, foot = side == 0 ? PartId.FootL : PartId.FootR;
-                if (body.Has(thigh)) legMass += body.Part(thigh).rb.mass;
-                if (body.Has(shin)) legMass += body.Part(shin).rb.mass;
-                if (body.Has(foot)) legMass += body.Part(foot).rb.mass;
-            }
-            float supported = Mathf.Max(5f, mass - legMass);
+            // 2) vertical support: carries the weight not borne by the stance legs, plus a PD toward the height target
+            float carried = Mathf.Max(0f, mass - StanceLegMass());
             float pelvisY = pelvis.rb.worldCenterOfMass.y;
             float vy = body.ComVelocity.y;
-            float hErr = heightTarget - pelvisY;
-            float fy = supported * (g + bs.heightGain * hErr - bs.heightDamping * vy) + extraLift;
-            fy = Mathf.Clamp(fy, 0f, 2.8f * mass * Mathf.Max(g, 1f)) * Mathf.Clamp01(legStrength);
-
+            float fy = carried * g * Mathf.Clamp(Cmd.lift, 0f, 1.25f) + mass * Cmd.heightWeight * (bs.heightGain * (Cmd.heightTarget - pelvisY) - bs.heightDamping * vy);
+            fy = Mathf.Clamp(fy, 0f, mass * g * 1.35f) * k;
+            AppliedLift = mass > 0f ? fy / (mass * Mathf.Max(0.1f, g)) : 0f;
+            // 3) horizontal: velocity tracking + COM centring, bounded so a real push still needs recovery steps
             Vector3 com = MathUtil.Flat(body.CenterOfMass);
             Vector3 v = MathUtil.Flat(body.ComVelocity);
-            Vector3 fh = mass * (bs.comDamping * (velTargetXZ - v));
-            if (usePosition) fh += mass * bs.comGain * (MathUtil.Flat(comTargetXZ) - com);
-            float mu = 0.9f * bs.friction;
-            float fhMax = mu * fy;
+            Vector3 fh = mass * (bs.velocityGain * Cmd.velocityWeight * (MathUtil.Flat(Cmd.velocityTarget) - v) +
+                                 bs.comGain * Cmd.centerWeight * (MathUtil.Flat(Cmd.centerTarget) - com));
+            float fhMax = bs.maxHorizontalAssist * mass * Mathf.Max(1f, g);
             if (fh.magnitude > fhMax) fh = fh.normalized * fhMax;
-
-            // Upright torques: pelvis paired with the feet (ankle strategy), chest paired with the pelvis (spine).
-            Vector3 tp = UprightTorque(pelvis.rb, pelvisTarget, bs.pelvisUprightSpring * body.MassScale, bs.pelvisUprightDamper * body.MassScale) * uprightScale;
-            Vector3 tc = chest != null && chest.attached ? UprightTorque(chest.rb, chestTarget, bs.chestUprightSpring * body.MassScale, bs.chestUprightDamper * body.MassScale) * uprightScale : Vector3.zero;
-            if (tc.magnitude > 450f) tc = tc.normalized * 450f;
-
-            // Distribute ground reaction by proximity of the COM to each stance foot.
-            float w0 = 0f, w1 = 0f;
-            if (FootGrounded[0]) w0 = 1f / (0.05f + (MathUtil.Flat(SolePos[0]) - com).magnitude);
-            if (FootGrounded[1]) w1 = 1f / (0.05f + (MathUtil.Flat(SolePos[1]) - com).magnitude);
-            float ws = w0 + w1;
-            if (ws <= 0f) return;
-            w0 /= ws; w1 /= ws;
-
+            fh *= k;
+            AppliedHorizontal = mass > 0f ? fh.magnitude / (mass * Mathf.Max(1f, g)) : 0f;
             Vector3 total = Vector3.up * fy + fh;
-            pelvis.rb.AddForce(total, ForceMode.Force);
-            Vector3 feetTorque = Vector3.zero;
-            for (int side = 0; side < 2; side++)
+            if (MathUtil.IsFinite(total))
             {
-                float w = side == 0 ? w0 : w1;
-                if (w <= 0f) continue;
-                var fp = FootPart[side];
-                fp.rb.AddForceAtPosition(-total * w, SolePos[side], ForceMode.Force);
-                // ankle capacity limited reaction torque
-                float load = fy * w;
-                Vector3 f = FootFwd[side];
-                Vector3 r = new Vector3(f.z, 0f, -f.x);
-                Vector3 desired = -tp * w;
-                float pitch = Vector3.Dot(desired, r), roll = Vector3.Dot(desired, f), yaw = desired.y;
-                float s = body.Scale * bs.ankleCapacity;
-                float capPitch = load * 0.11f * s, capRoll = load * 0.045f * s, capYaw = load * 0.05f * s;
-                pitch = Mathf.Clamp(pitch, -capPitch, capPitch);
-                roll = Mathf.Clamp(roll, -capRoll, capRoll);
-                yaw = Mathf.Clamp(yaw, -capYaw, capYaw);
-                Vector3 applied = r * pitch + f * roll + Vector3.up * yaw;
-                fp.rb.AddTorque(applied, ForceMode.Force);
-                feetTorque -= applied;
+                if (chest != null && chest.attached)
+                {
+                    pelvis.rb.AddForce(total * 0.7f, ForceMode.Force);
+                    chest.rb.AddForce(total * 0.3f, ForceMode.Force);
+                }
+                else pelvis.rb.AddForce(total, ForceMode.Force);
             }
-            // Pelvis receives what the feet can react, plus a bounded assist for the rest.
-            pelvis.rb.AddTorque(feetTorque, ForceMode.Force);
-            Assist(pelvis.rb, tp - feetTorque);
-            if (chest != null && chest.attached && tc.sqrMagnitude > 0f)
+            if (Cmd.liftChest > 0f && chest != null && chest.attached)
             {
-                chest.rb.AddTorque(tc, ForceMode.Force);
-                pelvis.rb.AddTorque(-tc, ForceMode.Force);
+                float cy = chest.rb.worldCenterOfMass.y;
+                float fc = mass * (Cmd.liftChest * g * 0.5f + bs.heightGain * 0.6f * (Cmd.chestHeightTarget - cy) - bs.heightDamping * 0.6f * Compat.GetVelocity(chest.rb).y);
+                fc = Mathf.Clamp(fc, 0f, mass * g * 0.9f) * k;
+                chest.rb.AddForce(Vector3.up * fc, ForceMode.Force);
+            }
+            if (Cmd.extraForce.sqrMagnitude > 0f && MathUtil.IsFinite(Cmd.extraForce)) pelvis.rb.AddForce(Cmd.extraForce, ForceMode.Force);
+        }
+
+        /// <summary>Adds the same velocity change to every attached segment (jumps, hops: the body moves as a unit).</summary>
+        public void AddBodyVelocity(Vector3 dv)
+        {
+            if (!MathUtil.IsFinite(dv)) return;
+            for (int i = 0; i < body.AttachedParts.Count; i++)
+            {
+                var p = body.AttachedParts[i];
+                if (p != null && p.rb != null && !p.rb.isKinematic) p.rb.AddForce(dv, ForceMode.VelocityChange);
             }
         }
     }
@@ -608,12 +777,11 @@ namespace RagdollSandbox
 
     #region LocomotionController
     public enum GaitMode { Normal, Hop }
+    public enum FootPhase { Stance, Lift, Swing, Plant }
 
     public class LocomotionController
     {
-        enum FootPhase { Stance, Swing }
-
-        struct FootState
+        public struct FootState
         {
             public FootPhase phase;
             public Vector3 planted;       // ankle target while in stance
@@ -623,10 +791,11 @@ namespace RagdollSandbox
             public float t, dur, clearance;
             public float lastPlant;
             public bool blocked;
+            public float phaseTime;
         }
 
         readonly RagdollBody body;
-        readonly FootState[] feet = new FootState[2];
+        public readonly FootState[] Feet = new FootState[2];
         public Vector3 DesiredVelocity;
         public float DesiredYaw;
         public float HeadingYaw;
@@ -634,6 +803,16 @@ namespace RagdollSandbox
         public GaitMode Mode = GaitMode.Normal;
         public float StumbleTimer;
         public float SlipTimer;
+        public float RecoveryUrgency;     // 0..1, how badly the capture point is outside the support
+        public int RecoverySteps;
+        public float LimpSide = -1f;      // 0 left, 1 right, -1 none
+        public float LimpAmount;
+        public float WidenStance;         // extra stance width (stagger)
+        public float Hunch;               // forward hunch from gut wounds (deg)
+        public float LegReach = 1f;
+        public float Bob;
+        public float HeightTarget;
+        public float Control = 1f;        // assist weight requested by the brain
         int lastSwing = 1;
         float doubleSupportUntil;
         bool initialized;
@@ -643,174 +822,191 @@ namespace RagdollSandbox
         float airTime;
         float hopTimer;
         int hopPhase;
-        public float LegReach = 1f;
         Rng rng;
-        public float Bob;
 
         public LocomotionController(RagdollBody b) { body = b; rng = new Rng(b.GetInstanceIDSafe() * 7 + 3); }
 
-        public bool Airborne { get { return jumpPhase == 3; } }
+        public bool Airborne { get { return jumpPhase == 3 || hopPhase == 2; } }
         public bool Jumping { get { return jumpPhase > 0; } }
         public float CrouchAmount { get { return crouchAmount; } }
+        public Quaternion Heading { get { return Quaternion.Euler(0f, HeadingYaw, 0f); } }
 
-        public void ResetFeet()
-        {
-            initialized = false;
-        }
+        public void ResetFeet() { initialized = false; }
 
         public void RequestJump()
         {
-            if (jumpPhase == 0 && body.Balance.SupportCount > 0) { jumpPhase = 1; jumpTimer = 0f; }
+            if (jumpPhase == 0 && body.Balance.SupportCount > 0 && Mode == GaitMode.Normal) { jumpPhase = 1; jumpTimer = 0f; }
         }
 
         void Init()
         {
             initialized = true;
+            if (body.Pelvis == null) return;
             HeadingYaw = MathUtil.Yaw(MathUtil.Flat(body.Pelvis.rb.rotation * Vector3.forward));
             DesiredYaw = HeadingYaw;
             for (int s = 0; s < 2; s++)
             {
-                feet[s].phase = FootPhase.Stance;
-                var fp = body.Balance.FootPart[s];
-                feet[s].planted = FootAnchor(s);
-                feet[s].plantedYaw = HeadingYaw + (s == 0 ? -6f : 6f);
-                feet[s].lastPlant = Time.time;
+                Feet[s].phase = FootPhase.Stance;
+                Feet[s].planted = FootAnchor(s);
+                Feet[s].plantedYaw = HeadingYaw + (s == 0 ? -5f : 5f);
+                Feet[s].lastPlant = Time.time;
             }
+            jumpPhase = 0;
+            hopPhase = 0;
         }
-
-        public Quaternion Heading { get { return Quaternion.Euler(0f, HeadingYaw, 0f); } }
 
         /// <summary>The leg's ground anchor: the ankle, or the distal end of the shin when the foot is missing.</summary>
         public Vector3 FootAnchor(int i)
         {
             var fp = body.Balance.FootPart[i];
             if (fp == null) return body.Pelvis.rb.position;
-            if (body.LegHasFoot[i]) return fp.rb.position;
-            return fp.rb.position + fp.rb.rotation * (Vector3.down * 0.39f * body.Scale);
+            if (PartInfo.IsFoot(fp.id)) return fp.rb.position;
+            return fp.transform.TransformPoint(fp.segAxis * fp.segMax);
         }
 
-        float AnchorHeight(int i) { return (body.LegHasFoot[i] ? 0.075f : 0.035f) * body.Scale; }
+        float AnchorHeight(int i)
+        {
+            var fp = body.Balance.FootPart[i];
+            return (fp != null && PartInfo.IsFoot(fp.id) ? 0.075f : 0.03f) * body.Scale;
+        }
 
-        /// <summary>Runs the gait. Returns false if the body could not be supported (should fall).</summary>
+        public bool IsSwinging(int side) { return Feet[side].phase == FootPhase.Swing || Feet[side].phase == FootPhase.Lift; }
+        bool AnySwing() { return IsSwinging(0) || IsSwinging(1); }
+
+        /// <summary>Runs the gait for one physics step and writes the balance command.
+        /// Returns false if the legs cannot support the body (the brain should let it fall).</summary>
         public bool Tick(float dt, float strengthScale)
         {
             var ls = Sandbox.Boot.locomotion;
+            var bs = Sandbox.Boot.balance;
             var bal = body.Balance;
             if (!initialized) Init();
             float s = body.Scale;
-            float g = bal.G;
             if (StumbleTimer > 0f) StumbleTimer -= dt;
             if (SlipTimer > 0f) SlipTimer -= dt;
 
-            // Heading
+            // heading
             float yawErr = Mathf.DeltaAngle(HeadingYaw, DesiredYaw);
-            HeadingYaw += Mathf.Clamp(yawErr, -ls.turnSpeed * dt, ls.turnSpeed * dt);
+            float turnRate = ls.turnSpeed * (Mode == GaitMode.Hop ? 0.5f : 1f);
+            HeadingYaw += Mathf.Clamp(yawErr, -turnRate * dt, turnRate * dt);
             Quaternion H = Heading;
             Vector3 fwd = H * Vector3.forward, right = H * Vector3.right;
 
             crouchAmount = Mathf.MoveTowards(crouchAmount, Crouch ? 1f : 0f, dt * 3f);
             float speed = DesiredVelocity.magnitude;
             float maxSpeed = Crouch ? ls.crouchSpeed : Run ? ls.runSpeed : ls.walkSpeed;
-            if (Mode == GaitMode.Hop) maxSpeed = Mathf.Min(maxSpeed, 0.9f);
+            if (Mode == GaitMode.Hop) maxSpeed = Mathf.Min(maxSpeed, ls.hopSpeed);
             Vector3 vDes = speed > maxSpeed ? DesiredVelocity / speed * maxSpeed : DesiredVelocity;
-            vDes *= Mathf.Lerp(0.35f, 1f, strengthScale) * (SlipTimer > 0f ? 0.6f : 1f);
+            vDes *= Mathf.Lerp(0.4f, 1f, strengthScale) * (SlipTimer > 0f ? 0.6f : 1f) * (1f - LimpAmount * 0.45f);
             float runFactor = Mathf.Clamp01((vDes.magnitude - ls.walkSpeed) / Mathf.Max(0.1f, ls.runSpeed - ls.walkSpeed));
+            RecoveryUrgency = Mathf.Clamp01((bal.SupportDistance - bs.captureMargin * s) / (0.3f * s));
 
-            // Jump state
-            float jumpLower = 0f, extraLift = 0f;
+            // jump state
+            float jumpLower = 0f;
+            Vector3 extra = Vector3.zero;
             if (jumpPhase > 0)
             {
                 jumpTimer += dt;
-                if (jumpPhase == 1) { jumpLower = 0.2f * s * Mathf.Clamp01(jumpTimer / 0.18f); if (jumpTimer > 0.2f) { jumpPhase = 2; jumpTimer = 0f; } }
+                if (jumpPhase == 1)
+                {
+                    jumpLower = 0.17f * s * Mathf.Clamp01(jumpTimer / 0.16f);
+                    if (jumpTimer > 0.18f)
+                    {
+                        jumpPhase = 2; jumpTimer = 0f;
+                        float up = Mathf.Sqrt(2f * Mathf.Max(0.5f, bal.G) * ls.jumpHeight * s) * Mathf.Lerp(0.5f, 1f, strengthScale);
+                        bal.AddBodyVelocity(Vector3.up * up + MathUtil.Flat(vDes) * 0.25f);
+                        for (int i = 0; i < 2; i++) { Feet[i].phase = FootPhase.Stance; }
+                        if (Sandbox.Audio != null) Sandbox.Audio.PlayVoice(Sfx.Grunt0, body.Pelvis.rb.position, 0.35f, rng.Range(0.95f, 1.1f));
+                    }
+                }
                 else if (jumpPhase == 2)
                 {
-                    extraLift = ls.jumpForce * body.TotalMass * g * strengthScale;
-                    if (jumpTimer > 0.14f || bal.SupportCount == 0) { jumpPhase = 3; jumpTimer = 0f; airTime = 0f; }
+                    if (jumpTimer > 0.1f) { jumpPhase = 3; jumpTimer = 0f; airTime = 0f; }
                 }
                 else if (jumpPhase == 3)
                 {
                     airTime += dt;
-                    if (airTime > 0.12f && bal.SupportCount > 0) { jumpPhase = 4; jumpTimer = 0f; PlantAll(); }
+                    if (airTime > 0.15f && bal.SupportCount > 0) { jumpPhase = 4; jumpTimer = 0f; PlantAll(); }
                     if (airTime > 2.5f) jumpPhase = 0;
                 }
-                else if (jumpPhase == 4) { jumpLower = 0.1f * s * (1f - Mathf.Clamp01(jumpTimer / 0.3f)); if (jumpTimer > 0.3f) jumpPhase = 0; }
+                else if (jumpPhase == 4) { jumpLower = 0.12f * s * (1f - Mathf.Clamp01(jumpTimer / 0.3f)); if (jumpTimer > 0.3f) jumpPhase = 0; }
             }
 
-            // Stance/swing state machine
-            if (jumpPhase != 3) StepLogic(dt, vDes, fwd, right, runFactor, yawErr);
+            bool airborne = jumpPhase == 2 || jumpPhase == 3;
+            if (!airborne)
+            {
+                if (Mode == GaitMode.Hop) HopLogic(dt, vDes, fwd, strengthScale);
+                else StepLogic(dt, vDes, fwd, right, runFactor, yawErr);
+            }
             else
             {
-                // airborne: legs prepare to land under the predicted centre of mass
-                for (int i = 0; i < 2; i++) { feet[i].phase = FootPhase.Stance; feet[i].planted = AirFootTarget(i, right); }
+                for (int i = 0; i < 2; i++) { Feet[i].phase = FootPhase.Stance; Feet[i].planted = AirFootTarget(i, right); }
             }
 
-            // Height target adapts to the stance feet heights
-            float lowest = float.MaxValue, highest = float.MinValue;
+            // height target from the stance feet
+            float lowest = float.MaxValue, highest = float.MinValue, sum = 0f;
+            int cnt = 0;
             for (int i = 0; i < 2; i++)
             {
                 if (bal.FootPart[i] == null) continue;
-                float gy = feet[i].phase == FootPhase.Stance ? feet[i].planted.y - AnchorHeight(i) : bal.GroundHeight;
+                float gy = Feet[i].phase == FootPhase.Stance || Feet[i].phase == FootPhase.Plant ? Feet[i].planted.y - AnchorHeight(i) : bal.FootGroundY[i];
+                if (Feet[i].phase == FootPhase.Swing) gy = Mathf.Min(gy, Feet[i].target.y - AnchorHeight(i));
                 lowest = Mathf.Min(lowest, gy); highest = Mathf.Max(highest, gy);
+                sum += gy; cnt++;
             }
-            float groundY = lowest < float.MaxValue ? Mathf.Lerp(lowest, highest, 0.35f) : bal.GroundHeight;
-            if (bal.SupportCount > 0) groundY = Mathf.Lerp(groundY, bal.GroundHeight, 0.5f);
+            float groundY = cnt > 0 ? Mathf.Lerp(lowest, sum / cnt, 0.6f) : bal.GroundHeight;
+            if (cnt == 0) groundY = bal.GroundHeight;
             float stand = bal.StandHeight;
-            float hTarget = groundY + stand * (1f - 0.33f * crouchAmount) - jumpLower - Mathf.Abs(Bob) * 0.02f * s;
+            float hTarget = groundY + stand * (1f - 0.3f * crouchAmount) - jumpLower - Mathf.Abs(Bob) * 0.015f * s - LimpAmount * 0.02f * s;
             if (Mode == GaitMode.Hop) hTarget -= 0.03f * s;
-            // stump leg (no foot) is shorter
-            for (int i = 0; i < 2; i++) if (bal.FootPart[i] != null && !body.LegHasFoot[i]) hTarget -= 0.04f * s;
+            for (int i = 0; i < 2; i++) if (bal.FootPart[i] != null && !PartInfo.IsFoot(bal.FootPart[i].id)) hTarget -= 0.025f * s;
+            if (highest - lowest > 0.08f * s) hTarget -= Mathf.Min(0.08f * s, (highest - lowest) * 0.25f); // stairs: knees bend more
+            HeightTarget = hTarget;
 
-            // Pelvis and chest targets: heading + lean with acceleration/velocity
+            // torso orientation: heading + lean into acceleration / speed + hunch
             Vector3 v = MathUtil.Flat(body.ComVelocity);
-            float lean = Mathf.Clamp(Vector3.Dot(vDes, fwd) * 4f + Vector3.Dot(vDes - v, fwd) * 6f, -8f, 16f) + runFactor * 6f + crouchAmount * 12f;
-            float roll = Mathf.Clamp(Vector3.Dot(vDes - v, right) * 5f, -6f, 6f);
-            if (StumbleTimer > 0f) lean += 10f;
+            float lean = Mathf.Clamp(Vector3.Dot(vDes, fwd) * 3.5f + Vector3.Dot(vDes - v, fwd) * 5f, -8f, 14f) + runFactor * 7f + crouchAmount * 14f + Hunch * 0.5f;
+            float roll = Mathf.Clamp(Vector3.Dot(vDes - v, right) * 4f, -6f, 6f);
+            if (StumbleTimer > 0f) lean += 8f;
             float sway = 0f;
-            for (int i = 0; i < 2; i++) if (feet[i].phase == FootPhase.Swing) sway += (i == 0 ? 1f : -1f) * 3f * Mathf.Sin(feet[i].t / Mathf.Max(0.01f, feet[i].dur) * Mathf.PI);
-            Quaternion pelvisTarget = H * Quaternion.Euler(lean * 0.4f, 0f, -roll + sway * 0.5f);
+            for (int i = 0; i < 2; i++) if (IsSwinging(i)) sway += (i == 0 ? 1f : -1f) * 2.5f * Mathf.Sin(Mathf.Clamp01(Feet[i].t / Mathf.Max(0.01f, Feet[i].dur)) * Mathf.PI);
+            Quaternion pelvisTarget = H * Quaternion.Euler(lean * 0.35f, 0f, -roll + sway * 0.4f);
             Quaternion chestTarget = H * Quaternion.Euler(lean, 0f, -roll * 0.5f);
 
+            // support capacity of the legs
             float legStr = 0f;
             int ln = 0;
-            for (int i = 0; i < 2; i++) if (bal.FootGrounded[i]) { legStr += Mathf.Clamp01(body.Muscles.LegStrength(i) * 1.25f); ln++; }
+            for (int i = 0; i < 2; i++) if (bal.FootPart[i] != null && body.LegUsable[i]) { legStr += Mathf.Clamp01(body.Muscles.LegStrength(i) * 1.3f); ln++; }
             legStr = ln > 0 ? legStr / ln : 0f;
-            legStr = Mathf.Clamp01(legStr) * strengthScale;
+            if (Mode == GaitMode.Hop) legStr *= 0.9f;
+            float support = 0f;
+            for (int i = 0; i < 2; i++) if (bal.FootGrounded[i] || bal.FootNearGround[i] || (Feet[i].phase == FootPhase.Swing && bal.FootPart[i] != null)) support += 0.5f;
+            if (Mode == GaitMode.Hop) support = Mathf.Min(1f, support * 2f);
+            support = Mathf.Clamp01(support);
 
-            Vector3 comTarget = bal.SupportCount > 0 ? bal.SupportCenter : MathUtil.Flat(body.CenterOfMass);
-            bool usePos = vDes.sqrMagnitude < 0.01f && !AnySwing();
-            if (bal.SupportCount > 0 && jumpPhase != 3)
-                bal.Support(hTarget, comTarget, usePos, vDes, pelvisTarget, chestTarget, legStr, Mathf.Lerp(0.3f, 1f, strengthScale), extraLift);
-            else
-            {
-                // airborne: keep the torso composed with the bounded assist only
-                bal.Assist(body.Pelvis.rb, BalanceController.UprightTorque(body.Pelvis.rb, pelvisTarget, 300f, 40f), 0.6f);
-            }
+            // balance command
+            var cmd = new BalanceCommand();
+            cmd.control = Control * Mathf.Clamp01(legStr * 1.2f) * Mathf.Lerp(0.5f, 1f, strengthScale);
+            cmd.pelvisTarget = pelvisTarget;
+            cmd.chestTarget = chestTarget;
+            cmd.upright = airborne ? 0.5f : 1f;
+            cmd.chestUpright = airborne ? 0.6f : 1f;
+            cmd.heightTarget = hTarget;
+            cmd.lift = airborne ? 0f : bs.weightSupport * support;
+            cmd.heightWeight = airborne ? 0f : support;
+            cmd.velocityTarget = vDes;
+            cmd.velocityWeight = airborne ? 0.05f : 1f;
+            bool standing = vDes.sqrMagnitude < 0.01f && !AnySwing();
+            cmd.centerTarget = bal.SupportCount > 0 ? bal.SupportCenter : MathUtil.Flat(body.CenterOfMass);
+            cmd.centerWeight = standing && bal.SupportCount > 0 ? 1f : 0f;
+            cmd.extraForce = extra;
+            bal.Cmd = cmd;
 
-            // Hop gait: periodic jumps on the single leg while moving
-            if (Mode == GaitMode.Hop) HopLogic(dt, vDes, fwd, strengthScale);
-
-            // Desired pelvis placement: above the support when standing, slightly ahead of itself when walking.
-            Vector3 pelvisPos = body.Pelvis.rb.position;
-            Vector3 desiredPelvis;
-            float blend;
-            if (bal.SupportCount > 0 && usePos)
-            {
-                Vector3 c = bal.SupportCenter - fwd * 0.02f * s;
-                desiredPelvis = new Vector3(c.x, hTarget, c.z);
-                blend = 0.6f;
-            }
-            else
-            {
-                desiredPelvis = new Vector3(pelvisPos.x, hTarget, pelvisPos.z) + vDes * 0.06f;
-                blend = jumpPhase == 3 ? 0f : 0.3f;
-            }
-            ApplyLegTargets(H, fwd, right, dt, strengthScale, pelvisTarget, desiredPelvis, blend);
-            SwingForces(dt);
+            ApplyLegTargets(H, fwd, dt, strengthScale);
+            FootForces(dt);
             ArmsAndSpine(fwd, runFactor);
-            return legStr > 0.12f || jumpPhase == 3;
+            return legStr > 0.12f || airborne;
         }
-
-        bool AnySwing() { return feet[0].phase == FootPhase.Swing || feet[1].phase == FootPhase.Swing; }
 
         void PlantAll()
         {
@@ -818,10 +1014,10 @@ namespace RagdollSandbox
             for (int i = 0; i < 2; i++)
             {
                 if (bal.FootPart[i] == null) continue;
-                feet[i].phase = FootPhase.Stance;
-                feet[i].planted = FootAnchor(i);
-                feet[i].plantedYaw = HeadingYaw + (i == 0 ? -6f : 6f);
-                feet[i].lastPlant = Time.time;
+                Feet[i].phase = FootPhase.Stance;
+                Feet[i].planted = FootAnchor(i);
+                Feet[i].plantedYaw = HeadingYaw + (i == 0 ? -5f : 5f);
+                Feet[i].lastPlant = Time.time;
             }
         }
 
@@ -832,117 +1028,147 @@ namespace RagdollSandbox
             float s = body.Scale;
             Vector3 cp = body.Balance.CapturePoint;
             Vector3 hip = body.Pelvis.rb.position;
-            Vector3 p = new Vector3(cp.x, hip.y - 0.75f * s, cp.z) + right * ((i == 0 ? -1f : 1f) * Sandbox.Boot.locomotion.stanceWidth * 0.5f * s);
+            Vector3 p = new Vector3(cp.x, hip.y - 0.78f * s, cp.z) + right * ((i == 0 ? -1f : 1f) * Sandbox.Boot.locomotion.stanceWidth * 0.5f * s);
             return p;
         }
 
         void StepLogic(float dt, Vector3 vDes, Vector3 fwd, Vector3 right, float runFactor, float yawErr)
         {
             var ls = Sandbox.Boot.locomotion;
-            var bs = Sandbox.Boot.balance;
             var bal = body.Balance;
             float s = body.Scale;
             bool moving = vDes.magnitude > 0.08f;
-            bool turning = Mathf.Abs(yawErr) > 22f;
+            bool turning = Mathf.Abs(yawErr) > 20f;
 
             for (int i = 0; i < 2; i++)
             {
-                if (bal.FootPart[i] == null) { feet[i].phase = FootPhase.Stance; continue; }
-                if (feet[i].phase == FootPhase.Stance)
+                if (bal.FootPart[i] == null) { Feet[i].phase = FootPhase.Stance; continue; }
+                Feet[i].phaseTime += dt;
+                if (Feet[i].phase == FootPhase.Stance)
                 {
-                    // slip detection: planted foot sliding away
-                    var fp = bal.FootPart[i];
+                    // slip detection: planted foot dragged away
                     Vector3 anchorPos = FootAnchor(i);
-                    float drift = MathUtil.Flat(anchorPos - feet[i].planted).magnitude;
-                    if (bal.FootGrounded[i] && drift > 0.07f * s)
-                    {
-                        feet[i].planted = anchorPos;
-                        SlipTimer = 0.8f;
-                    }
-                    if (!bal.FootGrounded[i] && drift > 0.25f * s) feet[i].planted = anchorPos;
+                    float drift = MathUtil.Flat(anchorPos - Feet[i].planted).magnitude;
+                    if (bal.FootGrounded[i] && drift > 0.08f * s) { Feet[i].planted = anchorPos; SlipTimer = 0.6f; }
+                    if (!bal.FootGrounded[i] && drift > 0.25f * s) Feet[i].planted = anchorPos;
+                }
+                else if (Feet[i].phase == FootPhase.Plant)
+                {
+                    if (Feet[i].phaseTime > 0.06f) { Feet[i].phase = FootPhase.Stance; Feet[i].phaseTime = 0f; }
+                }
+                else if (Feet[i].phase == FootPhase.Lift)
+                {
+                    Feet[i].t += dt;
+                    if (Feet[i].phaseTime > ls.liftTime) { Feet[i].phase = FootPhase.Swing; Feet[i].phaseTime = 0f; }
                 }
             }
 
-            // Advance swings
+            // advance swings
             for (int i = 0; i < 2; i++)
             {
-                if (feet[i].phase != FootPhase.Swing) continue;
-                feet[i].t += dt;
-                float u = feet[i].t / feet[i].dur;
+                if (Feet[i].phase != FootPhase.Swing) continue;
+                Feet[i].t += dt;
+                float u = Feet[i].t / Feet[i].dur;
                 if (u < 0.65f) RetargetSwing(i, vDes, fwd, right, runFactor);
                 var fp = bal.FootPart[i];
-                bool contact = fp != null && fp.Grounded && u > 0.55f;
-                if (u >= 1f || contact || feet[i].blocked)
+                bool contact = fp != null && (fp.Grounded || bal.FootGrounded[i]) && u > 0.5f;
+                if (u >= 1f || contact || Feet[i].blocked)
                 {
-                    feet[i].phase = FootPhase.Stance;
-                    feet[i].planted = feet[i].blocked || contact ? FootAnchor(i) : feet[i].target;
-                    feet[i].plantedYaw = feet[i].targetYaw;
-                    feet[i].lastPlant = Time.time;
-                    feet[i].blocked = false;
-                    doubleSupportUntil = Time.time + Mathf.Lerp(0.07f, 0f, runFactor);
+                    Feet[i].phase = FootPhase.Plant;
+                    Feet[i].phaseTime = 0f;
+                    Feet[i].planted = Feet[i].blocked || contact ? FootAnchor(i) : Feet[i].target;
+                    if (!Feet[i].blocked && !contact) Feet[i].planted = Vector3.Lerp(FootAnchor(i), Feet[i].target, 0.5f);
+                    Feet[i].plantedYaw = Feet[i].targetYaw;
+                    Feet[i].lastPlant = Time.time;
+                    Feet[i].blocked = false;
+                    doubleSupportUntil = Time.time + Mathf.Lerp(0.06f, 0.01f, Mathf.Max(runFactor, RecoveryUrgency));
                     PlayStep(fp);
                 }
             }
             if (AnySwing()) return;
             if (Time.time < doubleSupportUntil) return;
             int usable = (bal.FootPart[0] != null ? 1 : 0) + (bal.FootPart[1] != null ? 1 : 0);
-            if (usable < 2) return; // hop gait handles single leg
+            if (usable < 2) return; // the hop gait handles one leg
 
-            // Balance step: capture point outside support
-            bool needBalance = bal.SupportCount > 0 && bal.SupportDistance > bs.captureMargin * s;
-            if (!moving && !turning && !needBalance)
+            // decide whether to step
+            bool needBalance = bal.SupportCount > 0 && RecoveryUrgency > 0.01f;
+            bool lostSupport = bal.SupportCount == 0;
+            int foot = -1;
+            if (needBalance || lostSupport)
             {
-                // re-square the feet when standing still if they are far from a comfortable stance
-                float spread = MathUtil.Flat(feet[0].planted - feet[1].planted).magnitude;
-                if (spread < ls.stanceWidth * 2.2f * s && spread > ls.stanceWidth * 0.5f * s) return;
-            }
-            int foot;
-            if (needBalance && !moving)
-            {
-                Vector3 e = bal.CapturePoint - bal.SupportCenter;
+                Vector3 e = bal.CapturePoint - (bal.SupportCount > 0 ? bal.SupportCenter : MathUtil.Flat(body.CenterOfMass));
                 float lateral = Vector3.Dot(e, right);
-                if (Mathf.Abs(lateral) > 0.6f * e.magnitude) foot = lateral < 0f ? 0 : 1;
+                if (Mathf.Abs(lateral) > 0.55f * e.magnitude) foot = lateral < 0f ? 0 : 1;
                 else
                 {
-                    float d0 = (MathUtil.Flat(feet[0].planted) - bal.CapturePoint).sqrMagnitude, d1 = (MathUtil.Flat(feet[1].planted) - bal.CapturePoint).sqrMagnitude;
+                    float d0 = (MathUtil.Flat(Feet[0].planted) - bal.CapturePoint).sqrMagnitude, d1 = (MathUtil.Flat(Feet[1].planted) - bal.CapturePoint).sqrMagnitude;
                     foot = d0 > d1 ? 0 : 1;
                 }
+                if (moving && !lostSupport) foot = -1; // while walking, the regular cadence handles the capture point
             }
-            else
+            if (foot < 0 && moving)
             {
-                foot = 1 - lastSwing;
-                // prefer the trailing foot
-                float a0 = Vector3.Dot(feet[0].planted - body.Pelvis.rb.position, vDes), a1 = Vector3.Dot(feet[1].planted - body.Pelvis.rb.position, vDes);
-                if (moving && Mathf.Abs(a0 - a1) > 0.1f * s) foot = a0 < a1 ? 0 : 1;
+                // cadence: step with the trailing foot once the hip has passed it, or when the stance has lasted long enough
+                Vector3 hip = MathUtil.Flat(body.Pelvis.rb.position);
+                Vector3 dir = vDes.normalized;
+                float a0 = Vector3.Dot(MathUtil.Flat(Feet[0].planted) - hip, dir), a1 = Vector3.Dot(MathUtil.Flat(Feet[1].planted) - hip, dir);
+                int trailing = a0 < a1 ? 0 : 1;
+                float behind = -Mathf.Min(a0, a1);
+                float stepLen = Mathf.Lerp(ls.maxStride, ls.runStride, runFactor) * s;
+                float since = Time.time - Mathf.Max(Feet[0].lastPlant, Feet[1].lastPlant);
+                float limpHold = LimpSide >= 0f && (int)LimpSide == 1 - trailing ? LimpAmount * 0.12f : 0f;
+                if (behind > stepLen * 0.28f || since > 0.55f + limpHold) foot = trailing;
             }
-            StartSwing(foot, vDes, fwd, right, runFactor, needBalance && !moving);
+            if (foot < 0 && (turning || !moving))
+            {
+                // re-square the feet: wrong yaw, too close or too far apart
+                for (int i = 0; i < 2 && foot < 0; i++)
+                {
+                    float yawOff = Mathf.Abs(Mathf.DeltaAngle(Feet[i].plantedYaw, HeadingYaw));
+                    if (yawOff > 28f) foot = i;
+                }
+                if (foot < 0 && !moving)
+                {
+                    Vector3 rel = MathUtil.Flat(Feet[1].planted - Feet[0].planted);
+                    float lat = Vector3.Dot(rel, right), lon = Vector3.Dot(rel, fwd);
+                    float width = (ls.stanceWidth + WidenStance) * s;
+                    if (lat < width * 0.45f || lat > width * 2.4f || Mathf.Abs(lon) > 0.32f * s)
+                    {
+                        float since = Time.time - Mathf.Max(Feet[0].lastPlant, Feet[1].lastPlant);
+                        if (since > 0.25f) foot = 1 - lastSwing;
+                    }
+                    if (foot < 0 && bal.ComSupportDistance > -0.01f * s && Time.time - Mathf.Max(Feet[0].lastPlant, Feet[1].lastPlant) > 0.4f) foot = 1 - lastSwing;
+                }
+            }
+            if (foot < 0) return;
+            StartSwing(foot, vDes, fwd, right, runFactor, needBalance || lostSupport);
         }
 
         void StartSwing(int i, Vector3 vDes, Vector3 fwd, Vector3 right, float runFactor, bool emergency)
         {
             var ls = Sandbox.Boot.locomotion;
             var bal = body.Balance;
-            float s = body.Scale;
             var fp = bal.FootPart[i];
             if (fp == null) return;
-            feet[i].phase = FootPhase.Swing;
-            feet[i].t = 0f;
+            Feet[i].phase = FootPhase.Lift;
+            Feet[i].phaseTime = 0f;
+            Feet[i].t = 0f;
             float baseDur = Mathf.Lerp(ls.stepTimeWalk, ls.stepTimeRun, runFactor);
-            if (emergency) baseDur = Mathf.Min(baseDur, 0.3f);
-            if (StumbleTimer > 0f) baseDur *= 0.75f;
-            feet[i].dur = baseDur * (body.LegHasFoot[i] ? 1f : 1.25f);
-            feet[i].lift = FootAnchor(i);
-            feet[i].liftYaw = feet[i].plantedYaw;
-            feet[i].blocked = false;
+            if (emergency) { baseDur = Mathf.Min(baseDur, Mathf.Lerp(0.32f, 0.22f, RecoveryUrgency)); RecoverySteps++; }
+            if (StumbleTimer > 0f) baseDur *= 0.8f;
+            if (LimpSide >= 0f && (int)LimpSide == i) baseDur *= 1f + LimpAmount * 0.3f;
+            Feet[i].dur = baseDur * (body.LegHasFoot[i] ? 1f : 1.2f) + ls.liftTime;
+            Feet[i].lift = FootAnchor(i);
+            Feet[i].liftYaw = Feet[i].plantedYaw;
+            Feet[i].blocked = false;
             lastSwing = i;
             RetargetSwing(i, vDes, fwd, right, runFactor);
             ComputeClearance(i);
-            // toe-off push: the stance/lifting foot pushes against the ground
-            if (bal.FootGrounded[i])
+            // toe-off push: the lifting foot pushes the body forward (internal force pair against the ground)
+            if (bal.FootGrounded[i] && vDes.sqrMagnitude > 0.01f)
             {
                 float k = Mathf.Clamp01(vDes.magnitude / Mathf.Max(0.1f, ls.walkSpeed));
-                Vector3 push = MathUtil.SafeNormal(vDes, fwd) * ls.toeOffImpulse * k * body.MassScale;
-                push += Vector3.up * runFactor * body.TotalMass * bal.G * 0.045f;
+                Vector3 push = vDes.normalized * ls.toeOffImpulse * k * body.MassScale;
                 BalanceController.PairImpulse(body.Pelvis.rb, push, fp.rb);
             }
         }
@@ -954,42 +1180,53 @@ namespace RagdollSandbox
             float s = body.Scale;
             int other = 1 - i;
             float side = i == 0 ? -1f : 1f;
-            float remaining = Mathf.Max(0f, feet[i].dur - feet[i].t);
+            float remaining = Mathf.Max(0f, Feet[i].dur - Feet[i].t);
             Vector3 com = MathUtil.Flat(body.CenterOfMass);
             Vector3 v = MathUtil.Flat(body.ComVelocity);
-            Vector3 target = com + v * (remaining + feet[i].dur * 0.5f) + (v - vDes) * ls.raibertGain;
-            if (bal.SupportDistance > 0f && vDes.sqrMagnitude < 0.01f)
-                target = Vector3.Lerp(target, bal.CapturePoint + (bal.CapturePoint - bal.SupportCenter).normalized * 0.05f * s, 0.6f);
-            target += right * side * ls.stanceWidth * 0.5f * s;
-            // stride clamping relative to the other foot
-            Vector3 otherP = MathUtil.Flat(feet[other].planted);
+            float stanceTime = Mathf.Lerp(0.5f, 0.3f, runFactor);
+            // Raibert foothold: neutral point + correction for the velocity error
+            Vector3 target = com + v * (remaining + stanceTime * 0.5f) + (v - vDes) * ls.raibertGain;
+            if (RecoveryUrgency > 0f)
+            {
+                // capture point step: put the foot at (or just beyond) where the body would come to rest
+                Vector3 cp = bal.CapturePoint;
+                Vector3 dir = MathUtil.SafeNormal(cp - (bal.SupportCount > 0 ? bal.SupportCenter : com), fwd);
+                Vector3 cpTarget = cp + dir * Sandbox.Boot.balance.captureMargin * s * 1.5f;
+                target = Vector3.Lerp(target, cpTarget, Mathf.Clamp01(0.4f + RecoveryUrgency));
+            }
+            float width = (ls.stanceWidth + WidenStance) * s;
+            target += right * side * width * 0.5f;
+            // stride clamping relative to the stance foot
+            Vector3 otherP = MathUtil.Flat(Feet[other].planted);
             Vector3 rel = target - otherP;
             float along = Vector3.Dot(rel, fwd), lat = Vector3.Dot(rel, right);
-            float maxStride = Mathf.Lerp(ls.maxStride, ls.runStride, runFactor) * s * (SlipTimer > 0f ? 0.65f : 1f) * LegReach;
-            along = Mathf.Clamp(along, -maxStride * 0.7f, maxStride);
-            float minLat = ls.stanceWidth * 0.55f * s, maxLat = ls.stanceWidth * 2.6f * s;
+            float maxStride = Mathf.Lerp(ls.maxStride, ls.runStride, runFactor) * s * (SlipTimer > 0f ? 0.65f : 1f) * LegReach * (1f + RecoveryUrgency * 0.5f);
+            along = Mathf.Clamp(along, -maxStride * 0.75f, maxStride);
+            float minLat = width * 0.5f, maxLat = width * 2.6f + RecoveryUrgency * 0.25f * s;
             if (side < 0f) lat = Mathf.Clamp(lat, -maxLat, -minLat); else lat = Mathf.Clamp(lat, minLat, maxLat);
             target = otherP + fwd * along + right * lat;
-            // Ground query at the foothold
+            // foothold ground query
             RaycastHit hit;
-            float topY = body.Pelvis.rb.position.y + 0.3f * s;
+            float topY = body.Pelvis.rb.position.y + 0.25f * s;
             Vector3 n = Vector3.up;
             float gy = bal.GroundHeight;
             if (bal.Ground(new Vector3(target.x, topY, target.z), 2.2f * s, out hit))
             {
                 gy = hit.point.y;
                 n = hit.normal;
-                if (n.y < 0.6f)
+                if (n.y < 0.6f || gy > Feet[other].planted.y + ls.maxStepUp * s)
                 {
-                    target = Vector3.Lerp(target, otherP, 0.35f);
+                    // too steep or too high: shorten the step
+                    target = Vector3.Lerp(target, otherP, 0.4f);
                     if (bal.Ground(new Vector3(target.x, topY, target.z), 2.2f * s, out hit)) { gy = hit.point.y; n = hit.normal; }
                 }
             }
-            float yaw = HeadingYaw + side * 6f;
+            float yaw = HeadingYaw + side * 5f;
             Vector3 footFwd = Quaternion.Euler(0f, yaw, 0f) * Vector3.forward;
             Vector3 fwdOnGround = Vector3.ProjectOnPlane(footFwd, n).normalized;
-            feet[i].target = new Vector3(target.x, gy, target.z) + n * AnchorHeight(i) - fwdOnGround * (body.LegHasFoot[i] ? 0.065f * s : 0f);
-            feet[i].targetYaw = yaw;
+            bool isFoot = bal.FootPart[i] != null && PartInfo.IsFoot(bal.FootPart[i].id);
+            Feet[i].target = new Vector3(target.x, gy, target.z) + n * AnchorHeight(i) - fwdOnGround * (isFoot ? 0.065f * s : 0f);
+            Feet[i].targetYaw = yaw;
         }
 
         void ComputeClearance(int i)
@@ -997,60 +1234,61 @@ namespace RagdollSandbox
             var ls = Sandbox.Boot.locomotion;
             var bal = body.Balance;
             float s = body.Scale;
-            float maxH = Mathf.Max(feet[i].lift.y, feet[i].target.y) - AnchorHeight(i);
+            float maxH = Mathf.Max(Feet[i].lift.y, Feet[i].target.y) - AnchorHeight(i);
             float topY = body.Pelvis.rb.position.y;
             for (int k = 1; k <= 3; k++)
             {
-                Vector3 p = Vector3.Lerp(feet[i].lift, feet[i].target, k / 4f);
+                Vector3 p = Vector3.Lerp(Feet[i].lift, Feet[i].target, k / 4f);
                 RaycastHit hit;
                 if (bal.Ground(new Vector3(p.x, topY, p.z), 2f * s, out hit)) maxH = Mathf.Max(maxH, hit.point.y);
             }
-            float baseY = Mathf.Max(feet[i].lift.y, feet[i].target.y) - AnchorHeight(i);
-            feet[i].clearance = ls.stepHeight * s + Mathf.Max(0f, maxH - baseY) + (StumbleTimer > 0f ? 0.04f * s : 0f);
+            float baseY = Mathf.Max(Feet[i].lift.y, Feet[i].target.y) - AnchorHeight(i);
+            Feet[i].clearance = ls.stepHeight * s + Mathf.Max(0f, maxH - baseY) + (StumbleTimer > 0f ? 0.04f * s : 0f);
         }
 
-        /// <summary>Called when a swinging foot hits an obstacle: trip/stumble.</summary>
+        /// <summary>Called when a swinging foot hits an obstacle: lift higher, or trip.</summary>
         public void OnFootBlocked(int side, float speed)
         {
-            if (feet[side].phase != FootPhase.Swing) return;
-            if (speed < 0.9f) { feet[side].clearance += 0.08f * body.Scale; return; }
+            if (Feet[side].phase != FootPhase.Swing) return;
+            if (speed < 0.9f) { Feet[side].clearance += 0.08f * body.Scale; return; }
             if (rng.Value < Sandbox.Boot.locomotion.stumbleChance)
             {
-                feet[side].blocked = true;
+                Feet[side].blocked = true;
                 StumbleTimer = 0.9f;
                 body.Muscles.Flinch(0.6f);
             }
-            else feet[side].clearance += 0.1f * body.Scale;
+            else Feet[side].clearance += 0.1f * body.Scale;
         }
-
-        public bool IsSwinging(int side) { return feet[side].phase == FootPhase.Swing; }
 
         void HopLogic(float dt, Vector3 vDes, Vector3 fwd, float strengthScale)
         {
             var ls = Sandbox.Boot.locomotion;
             var bal = body.Balance;
-            int leg = bal.FootPart[0] != null ? 0 : 1;
+            int leg = bal.FootPart[0] != null && body.LegUsable[0] ? 0 : 1;
             if (bal.FootPart[leg] == null) return;
+            int other = 1 - leg;
             hopTimer += dt;
-            bool wantMove = vDes.magnitude > 0.1f || bal.SupportDistance > 0.06f * body.Scale;
+            bool wantMove = vDes.magnitude > 0.1f || RecoveryUrgency > 0.05f;
+            if (bal.FootPart[other] != null) { Feet[other].phase = FootPhase.Swing; Feet[other].t = 0.5f; Feet[other].dur = 1f; Feet[other].target = FootAnchor(leg) + Vector3.up * 0.25f * body.Scale; }
             switch (hopPhase)
             {
                 case 0:
-                    if (wantMove && bal.FootGrounded[leg] && hopTimer > 0.3f) { hopPhase = 1; hopTimer = 0f; }
+                    Feet[leg].phase = FootPhase.Stance;
+                    if (wantMove && bal.FootGrounded[leg] && hopTimer > 0.35f) { hopPhase = 1; hopTimer = 0f; }
                     break;
                 case 1:
                     if (hopTimer > 0.12f)
                     {
                         hopPhase = 2; hopTimer = 0f;
                         Vector3 dir = vDes.sqrMagnitude > 0.01f ? vDes.normalized : MathUtil.SafeNormal(bal.CapturePoint - bal.SupportCenter, fwd);
-                        Vector3 j = Vector3.up * ls.hopForce * body.TotalMass * 0.95f * strengthScale + dir * body.TotalMass * 0.9f * strengthScale;
-                        BalanceController.PairImpulse(body.Pelvis.rb, j, bal.FootPart[leg].rb);
+                        float up = ls.hopForce * Mathf.Lerp(0.6f, 1f, strengthScale);
+                        bal.AddBodyVelocity(Vector3.up * up + dir * Mathf.Min(1.2f, vDes.magnitude + RecoveryUrgency) * 0.8f);
                     }
                     break;
                 case 2:
-                    feet[leg].phase = FootPhase.Stance;
-                    feet[leg].planted = AirFootTarget(leg, Vector3.zero) + Vector3.up * 0.05f * body.Scale;
-                    if (hopTimer > 0.15f && bal.FootGrounded[leg]) { hopPhase = 0; hopTimer = 0f; feet[leg].planted = FootAnchor(leg); PlayStep(bal.FootPart[leg]); }
+                    Feet[leg].phase = FootPhase.Stance;
+                    Feet[leg].planted = AirFootTarget(leg, Vector3.zero) + Vector3.up * 0.04f * body.Scale;
+                    if (hopTimer > 0.15f && bal.FootGrounded[leg]) { hopPhase = 0; hopTimer = 0f; Feet[leg].planted = FootAnchor(leg); PlayStep(bal.FootPart[leg]); }
                     if (hopTimer > 1.5f) { hopPhase = 0; hopTimer = 0f; }
                     break;
             }
@@ -1064,92 +1302,112 @@ namespace RagdollSandbox
             if (Sandbox.Blood != null) Sandbox.Blood.OnFootPlant(fp);
         }
 
-        /// <summary>Leg IK from a blend of the actual and the desired hip positions; hip targets are expressed relative to
-        /// the desired (upright) pelvis so the implicit joint drives hold the whole chain from the planted feet up.</summary>
-        void ApplyLegTargets(Quaternion H, Vector3 fwd, Vector3 right, float dt, float strengthScale, Quaternion pelvisRef, Vector3 pelvisPosDesired, float blend)
+        /// <summary>Leg IK from the actual hips to the stance/swing foot targets. Each bone's local target is taken
+        /// relative to its actual parent, so feet land where planned even when the torso wobbles.</summary>
+        void ApplyLegTargets(Quaternion H, Vector3 fwd, float dt, float strengthScale)
         {
             var bal = body.Balance;
             var mus = body.Muscles;
             float s = body.Scale;
-            Quaternion pelvisRot = pelvisRef;
+            var pelvis = body.Pelvis;
             for (int i = 0; i < 2; i++)
             {
                 PartId thigh = i == 0 ? PartId.ThighL : PartId.ThighR, shin = i == 0 ? PartId.ShinL : PartId.ShinR, foot = i == 0 ? PartId.FootL : PartId.FootR;
-                if (!body.Has(thigh) || !body.Has(shin)) continue;
+                if (!body.Has(thigh) || !body.Has(shin) || bal.FootPart[i] == null) continue;
                 var th = body.Part(thigh);
-                Vector3 hipActual = th.rb.position;
-                float hAdjust = Mathf.Clamp((body.Balance.StandHeight - bal.PelvisHeight) * 0.4f, -0.08f * s, 0.08f * s);
-                Vector3 hipDesired = pelvisPosDesired + pelvisRef * ((PartInfo.Origin[(int)thigh] - PartInfo.Origin[(int)PartId.Pelvis]) * s);
-                Vector3 hip = Vector3.Lerp(hipActual + Vector3.up * hAdjust, hipDesired, blend);
+                var sh = body.Part(shin);
+                Vector3 hip = th.rb.position;
                 Vector3 ankle;
                 float yaw;
                 float pitch = 0f;
                 Vector3 groundN = Vector3.up;
-                if (feet[i].phase == FootPhase.Swing)
+                var f = Feet[i];
+                if (f.phase == FootPhase.Swing || f.phase == FootPhase.Lift)
                 {
-                    float u = Mathf.Clamp01(feet[i].t / Mathf.Max(0.01f, feet[i].dur));
+                    float u = Mathf.Clamp01(f.t / Mathf.Max(0.01f, f.dur));
                     float e = MathUtil.SmoothStep01(u);
-                    Vector3 a = feet[i].lift, d = feet[i].target;
+                    Vector3 a = f.lift, d = f.target;
                     Vector3 dir = MathUtil.SafeNormal(MathUtil.Flat(d - a), fwd);
-                    float c = feet[i].clearance * 1.35f;
-                    Vector3 b = a + Vector3.up * c + dir * 0.04f * s, cc = d + Vector3.up * c - dir * 0.04f * s;
+                    float c = f.clearance * 1.4f;
+                    Vector3 b = a + Vector3.up * c + dir * 0.03f * s, cc = d + Vector3.up * c - dir * 0.03f * s;
                     ankle = MathUtil.Bezier(a, b, cc, d, e);
                     Vector3 next = MathUtil.Bezier(a, b, cc, d, MathUtil.SmoothStep01(Mathf.Min(1f, u + 0.02f)));
-                    feet[i].swingVel = (next - ankle) / Mathf.Max(0.001f, feet[i].dur * 0.02f);
-                    feet[i].swingPos = ankle;
-                    yaw = Mathf.LerpAngle(feet[i].liftYaw, feet[i].targetYaw, e);
-                    pitch = u < 0.3f ? Mathf.Lerp(18f, 0f, u / 0.3f) : u > 0.75f ? Mathf.Lerp(0f, -12f, (u - 0.75f) / 0.25f) : 0f;
+                    Feet[i].swingVel = (next - ankle) / Mathf.Max(0.001f, f.dur * 0.02f);
+                    Feet[i].swingPos = ankle;
+                    yaw = Mathf.LerpAngle(f.liftYaw, f.targetYaw, e);
+                    pitch = u < 0.25f ? Mathf.Lerp(22f, 0f, u / 0.25f) : u > 0.75f ? Mathf.Lerp(0f, -10f, (u - 0.75f) / 0.25f) : 0f;
                 }
                 else
                 {
-                    ankle = feet[i].planted;
-                    yaw = feet[i].plantedYaw;
-                    if (bal.FootGrounded[i]) groundN = bal.FootPart[i].groundNormal;
-                    // heel-to-toe roll during stance when walking
-                    float behind = Vector3.Dot(ankle - body.Pelvis.rb.position, fwd);
-                    if (DesiredVelocity.sqrMagnitude > 0.05f && behind < -0.15f * s) pitch = Mathf.Clamp(-(behind + 0.15f * s) * 60f / s, 0f, 20f);
+                    ankle = f.planted;
+                    yaw = f.plantedYaw;
+                    if (bal.FootGrounded[i]) groundN = bal.FootGroundN[i];
+                    if (groundN.y < 0.5f) groundN = Vector3.up;
+                    // heel-to-toe roll at the end of the stance when walking
+                    float behind = Vector3.Dot(ankle - pelvis.rb.position, fwd);
+                    if (DesiredVelocity.sqrMagnitude > 0.05f && behind < -0.12f * s) pitch = Mathf.Clamp(-(behind + 0.12f * s) * 70f / s, 0f, 22f);
                 }
                 float l1 = (PartInfo.Origin[(int)thigh] - PartInfo.Origin[(int)shin]).magnitude * s;
                 float l2 = (PartInfo.Origin[(int)shin] - PartInfo.Origin[(int)foot]).magnitude * s;
-                if (!body.LegHasFoot[i]) l2 *= 0.92f;
-                Vector3 knee = Quaternion.Euler(0f, yaw - HeadingYaw, 0f) * fwd;
+                var anchorPart = bal.FootPart[i];
+                if (!PartInfo.IsFoot(anchorPart.id)) l2 = Mathf.Max(0.05f * s, anchorPart.segMax);
+                Vector3 kneeDir = Quaternion.Euler(0f, yaw - HeadingYaw, 0f) * fwd;
                 Vector3 d1, d2, p1, p2, kneePos;
-                IKSolver.TwoBone(hip, ankle, knee, l1, l2, LegReach, out d1, out d2, out p1, out p2, out kneePos);
+                IKSolver.TwoBone(hip, ankle, kneeDir, l1, l2, LegReach, out d1, out d2, out p1, out p2, out kneePos);
                 Quaternion thighW = Pose.FromDirs(thigh, d1, p1);
                 Quaternion shinW = Pose.FromDirs(shin, d2, p2);
-                mus.Set(thigh, Quaternion.Inverse(pelvisRot) * thighW);
-                mus.Set(shin, Quaternion.Inverse(thighW) * shinW);
+                float stiff = f.phase == FootPhase.Swing ? 0.75f : 1f;
+                mus.Set(thigh, Quaternion.Inverse(pelvis.rb.rotation) * thighW, stiff);
+                var thighDistal = body.DistalOf(thigh);
+                mus.Set(shin, Quaternion.Inverse(thighDistal != null ? thighDistal.rb.rotation : th.rb.rotation) * shinW, stiff);
                 if (body.Has(foot))
                 {
                     Vector3 ff = Quaternion.Euler(0f, yaw, 0f) * Vector3.forward;
                     Vector3 fg = Vector3.ProjectOnPlane(ff, groundN).normalized;
                     Quaternion footW = Quaternion.LookRotation(fg, groundN) * Quaternion.AngleAxis(pitch, Vector3.right);
-                    mus.Set(foot, Quaternion.Inverse(shinW) * footW);
+                    var shinDistal = body.DistalOf(shin);
+                    mus.Set(foot, Quaternion.Inverse(shinDistal != null ? shinDistal.rb.rotation : sh.rb.rotation) * footW, stiff);
                 }
             }
         }
 
-        void SwingForces(float dt)
+        /// <summary>Stance feet are held in place (anti-slide), swing feet are guided along their arc. Both are bounded
+        /// forces paired with the pelvis so they never add net momentum.</summary>
+        void FootForces(float dt)
         {
             var ls = Sandbox.Boot.locomotion;
             var bal = body.Balance;
             float g = bal.G;
+            var pelvis = body.Pelvis;
             for (int i = 0; i < 2; i++)
             {
-                if (feet[i].phase != FootPhase.Swing) continue;
                 var fp = bal.FootPart[i];
                 if (fp == null) continue;
-                PartId shin = i == 0 ? PartId.ShinL : PartId.ShinR;
-                float m = fp.rb.mass + (body.Has(shin) && fp.id != shin ? body.Part(shin).rb.mass : 0f);
                 Vector3 anchorPos = FootAnchor(i);
-                Vector3 err = feet[i].swingPos - anchorPos;
-                Vector3 verr = feet[i].swingVel - fp.rb.GetPointVelocity(anchorPos);
-                Vector3 f = m * (ls.swingFootGain * err + ls.swingFootDamping * verr) + Vector3.up * m * g * 0.85f;
-                float max = 450f * body.MassScale;
-                if (f.magnitude > max) f = f.normalized * max;
-                if (!MathUtil.IsFinite(f)) continue;
-                fp.rb.AddForceAtPosition(f, anchorPos, ForceMode.Force);
-                body.Pelvis.rb.AddForce(-f, ForceMode.Force);
+                if (Feet[i].phase == FootPhase.Swing || Feet[i].phase == FootPhase.Lift)
+                {
+                    PartId shin = i == 0 ? PartId.ShinL : PartId.ShinR;
+                    float m = fp.rb.mass + (body.Has(shin) && fp.id != shin ? body.Part(shin).rb.mass : 0f);
+                    Vector3 err = Feet[i].swingPos - anchorPos;
+                    Vector3 verr = Feet[i].swingVel - fp.rb.GetPointVelocity(anchorPos);
+                    Vector3 f = m * (ls.swingFootGain * err + ls.swingFootDamping * verr) + Vector3.up * m * g * 0.8f;
+                    float max = ls.swingForceLimit * body.MassScale;
+                    if (f.magnitude > max) f = f.normalized * max;
+                    if (!MathUtil.IsFinite(f)) continue;
+                    fp.rb.AddForceAtPosition(f, anchorPos, ForceMode.Force);
+                    pelvis.rb.AddForce(-f, ForceMode.Force);
+                }
+                else if (bal.FootGrounded[i])
+                {
+                    Vector3 err = MathUtil.Flat(Feet[i].planted - anchorPos);
+                    Vector3 vel = MathUtil.Flat(fp.rb.GetPointVelocity(anchorPos));
+                    Vector3 f = (ls.footLockGain * err - ls.footLockDamping * vel) * body.MassScale;
+                    float max = ls.footLockLimit * body.MassScale;
+                    if (f.magnitude > max) f = f.normalized * max;
+                    if (!MathUtil.IsFinite(f)) continue;
+                    fp.rb.AddForceAtPosition(f, anchorPos, ForceMode.Force);
+                    pelvis.rb.AddForce(-f, ForceMode.Force);
+                }
             }
         }
 
@@ -1161,39 +1419,32 @@ namespace RagdollSandbox
             float s = body.Scale;
             Vector3 hipC = body.Pelvis.rb.position;
             float legOff0 = 0f, legOff1 = 0f;
-            if (body.Balance.FootPart[0] != null) legOff0 = Mathf.Clamp(Vector3.Dot(body.Balance.FootPart[0].rb.position - hipC, fwd) / (0.3f * s), -1f, 1f);
-            if (body.Balance.FootPart[1] != null) legOff1 = Mathf.Clamp(Vector3.Dot(body.Balance.FootPart[1].rb.position - hipC, fwd) / (0.3f * s), -1f, 1f);
+            var bal = body.Balance;
+            if (bal.FootPart[0] != null) legOff0 = Mathf.Clamp(Vector3.Dot(FootAnchor(0) - hipC, fwd) / (0.3f * s), -1f, 1f);
+            if (bal.FootPart[1] != null) legOff1 = Mathf.Clamp(Vector3.Dot(FootAnchor(1) - hipC, fwd) / (0.3f * s), -1f, 1f);
             float moving = Mathf.Clamp01(DesiredVelocity.magnitude / 0.6f);
             float swing = ls.armSwing * (1f + runFactor * 0.8f) * moving;
-            float elbow = Mathf.Lerp(14f, 80f, runFactor * moving);
-            float stumbleSpread = StumbleTimer > 0f ? 45f : 0f;
-            float oneLeg = Mode == GaitMode.Hop ? 50f : 0f;
-            // armless sides keep balance by spreading the remaining arm a little
-            float lostArmComp = (body.ArmUsable[0] ? 0f : 12f) + (body.ArmUsable[1] ? 0f : 12f);
-            if (!brain.ArmOverride[0])
-            {
-                mus.Set(PartId.UpperArmL, Pose.ArmUpperLocal(-1f, 9f + stumbleSpread + oneLeg + lostArmComp, 4f - swing * legOff0 + stumbleSpread * 0.5f, 0f));
-                mus.Set(PartId.ForearmL, Pose.ElbowLocal(-1f, elbow + stumbleSpread * 0.3f, 0f));
-                mus.Set(PartId.HandL, Quaternion.identity);
-            }
-            if (!brain.ArmOverride[1])
-            {
-                mus.Set(PartId.UpperArmR, Pose.ArmUpperLocal(1f, 9f + stumbleSpread + oneLeg + lostArmComp, 4f - swing * legOff1 + stumbleSpread * 0.5f, 0f));
-                mus.Set(PartId.ForearmR, Pose.ElbowLocal(1f, elbow + stumbleSpread * 0.3f, 0f));
-                mus.Set(PartId.HandR, Quaternion.identity);
-            }
-            // spine counter-rotation against the pelvis
+            float elbow = Mathf.Lerp(14f, 85f, runFactor * moving);
+            float oneLeg = Mode == GaitMode.Hop ? 45f : 0f;
+            float lostArmComp = (body.ArmUsable[0] ? 0f : 14f) + (body.ArmUsable[1] ? 0f : 14f);
+            // counter-swing: each arm swings opposite to the leg on its side
+            mus.Set(PartId.UpperArmL, Pose.ArmUpperLocal(-1f, 9f + oneLeg + lostArmComp, 4f - swing * legOff0, 0f));
+            mus.Set(PartId.ForearmL, Pose.ElbowLocal(-1f, elbow, 0f));
+            mus.Set(PartId.HandL, Quaternion.identity);
+            mus.Set(PartId.UpperArmR, Pose.ArmUpperLocal(1f, 9f + oneLeg + lostArmComp, 4f - swing * legOff1, 0f));
+            mus.Set(PartId.ForearmR, Pose.ElbowLocal(1f, elbow, 0f));
+            mus.Set(PartId.HandR, Quaternion.identity);
             float counter = (legOff0 - legOff1) * ls.spineCounterRotation * moving;
-            float lean = runFactor * 6f + crouchAmount * 10f;
+            float lean = runFactor * 6f + crouchAmount * 10f + Hunch;
             float breath = brain.BreathOffset;
-            mus.Set(PartId.Abdomen, Pose.SpineLocal(lean * 0.4f + breath * 0.4f, counter * 0.5f, 0f));
-            mus.Set(PartId.Chest, Pose.SpineLocal(lean * 0.3f - breath, counter * 0.5f, 0f));
+            mus.Set(PartId.Abdomen, Pose.SpineLocal(lean * 0.45f + breath * 0.4f, counter * 0.5f, 0f));
+            mus.Set(PartId.Chest, Pose.SpineLocal(lean * 0.35f - breath, counter * 0.5f, 0f));
         }
     }
     #endregion
 
     #region MotorBrain
-    public enum MotorState { Stand, Fall, Lie, GetUp, Crawl, Hop, Headless, Unconscious, Dead }
+    public enum MotorState { Stand, Fall, Lie, GetUp, Crawl, Hop, Hang, Headless, Unconscious, Dead }
 
     public struct PossessInput
     {
@@ -1212,18 +1463,20 @@ namespace RagdollSandbox
         public bool Possessed;
         public PossessInput Input;
         bool jumpLatch;
-        public readonly bool[] ArmOverride = new bool[2];
         public float BreathOffset;
         public Vector3 GazeTarget;
         public bool HasCommand;
         public Vector3 CommandTarget;
+        public bool ExternalControl;      // the self-test or a network player drives DesiredVelocity directly
+        public Vector3 ExternalVelocity;
         Vector3 wanderTarget;
         float wanderTimer;
         int getUpAttempts;
         float getUpPhaseTime;
-        int getUpPhase;
+        public int GetUpPhase;
         float lieQuietTime;
-        float fallImpactTime = -10f;
+        float impactTime = -10f;
+        bool impacted;
         float crawlTimer;
         int crawlArm;
         int crawlPhase;
@@ -1236,10 +1489,28 @@ namespace RagdollSandbox
         Vector3 saccade;
         float grabStruggle;
         BodyPart grabbedPart;
-        readonly FixedJoint[] handGrip = new FixedJoint[2];
         float breathPhase;
         float painVoiceCooldown;
+        float fallTimer, lowTimer;
+        float flailTimer;
+        float holdHeadTimer;
+        Vector3 braceTarget;
+        bool braceHasTarget;
         Rng rng;
+
+        // behaviour weights (smoothly blended, never switched)
+        public float WStagger, WBrace, WProtect, WClutch, WHunch, WHoldHead, WFlail, WStruggle;
+        public readonly float[] WGrab = new float[2];
+
+        // grab-and-hold
+        public readonly ConfigurableJoint[] Grip = new ConfigurableJoint[2];
+        public readonly float[] GripStamina = { 1f, 1f };
+        readonly Collider[] grabCandidates = new Collider[24];
+        readonly Collider[] grabTargetCol = new Collider[2];
+        readonly Vector3[] grabTargetLocal = new Vector3[2];
+        readonly bool[] hasGrabTarget = new bool[2];
+        float grabSearchTimer;
+        float regripCooldown;
 
         public MotorBrain(RagdollBody b) { body = b; rng = new Rng(b.GetInstanceIDSafe() * 13 + 5); wanderTarget = b.transform.position; }
 
@@ -1252,7 +1523,7 @@ namespace RagdollSandbox
 
         public void CommandWalkTo(Vector3 p) { HasCommand = true; CommandTarget = p; }
 
-        public void SetGrabbed(BodyPart part) { grabbedPart = part; grabStruggle = part != null ? 1f : 0f; }
+        public void SetGrabbed(BodyPart part) { grabbedPart = part; grabStruggle = part != null ? 1f : 0f; if (part != null) body.LastInteractionTime = Time.time; }
 
         public void OnTopologyChanged()
         {
@@ -1266,10 +1537,14 @@ namespace RagdollSandbox
             State = s;
             StateTime = 0f;
             if (s == MotorState.Stand || s == MotorState.Hop) body.Locomotion.PlantCurrent();
-            if (s == MotorState.GetUp) { getUpPhase = 0; getUpPhaseTime = 0f; }
+            if (s == MotorState.GetUp) { GetUpPhase = 0; getUpPhaseTime = 0f; }
             if (s == MotorState.Lie) lieQuietTime = 0f;
             if (s == MotorState.Crawl) { crawlPhase = 0; crawlTimer = 0f; }
+            if (s == MotorState.Fall) { impacted = false; fallTimer = 0f; }
         }
+
+        float Will { get { return Sandbox.Boot.vitals.willToLive; } }
+        float React { get { return Sandbox.Boot.general.reactions ? Sandbox.Boot.behaviour.reactionStrength : 0f; } }
 
         bool CanStand
         {
@@ -1277,9 +1552,7 @@ namespace RagdollSandbox
             {
                 var v = body.Vitals;
                 bool legs = body.LegUsable[0] && body.LegUsable[1] && !body.LegsParalyzed;
-                bool bothBroken = body.Has(PartId.ThighL) && body.Has(PartId.ThighR) && (body.Part(PartId.ThighL).fractured || body.Part(PartId.ShinL).fractured) &&
-                                  (body.Part(PartId.ThighR).fractured || body.Part(PartId.ShinR).fractured);
-                return legs && !bothBroken && v.Consciousness > 0.5f && body.BrainPresent;
+                return legs && v.Consciousness > 0.5f && body.BrainPresent;
             }
         }
 
@@ -1288,13 +1561,13 @@ namespace RagdollSandbox
             get
             {
                 int legs = (body.LegUsable[0] ? 1 : 0) + (body.LegUsable[1] ? 1 : 0);
-                return legs == 1 && !body.LegsParalyzed && body.Vitals.Consciousness > 0.6f && body.BrainPresent && Sandbox.Boot.vitals.willToLive > 0.3f;
+                return legs == 1 && !body.LegsParalyzed && body.Vitals.Consciousness > 0.6f && body.BrainPresent && Will > 0.3f;
             }
         }
 
         bool CanCrawl
         {
-            get { return (body.ArmUsable[0] || body.ArmUsable[1]) && !body.BodyParalyzed && body.Vitals.Consciousness > 0.4f && body.BrainPresent && Sandbox.Boot.vitals.willToLive > 0.15f; }
+            get { return (body.ArmUsable[0] || body.ArmUsable[1]) && !body.BodyParalyzed && body.Vitals.Consciousness > 0.4f && body.BrainPresent && Will > 0.15f; }
         }
 
         public void FixedTick(float dt)
@@ -1303,17 +1576,21 @@ namespace RagdollSandbox
             var v = body.Vitals;
             var mus = body.Muscles;
             var bal = body.Balance;
-            var loc = body.Locomotion;
             mus.GlobalScale = 1f;
             mus.Brace = 0f;
-            ArmOverride[0] = false; ArmOverride[1] = false;
+            mus.LegScaleL = 1f; mus.LegScaleR = 1f;
+            body.Locomotion.Control = 1f;
             if (painVoiceCooldown > 0f) painVoiceCooldown -= dt;
             if (shieldTimer > 0f) shieldTimer -= dt;
             if (clutchCooldown > 0f) clutchCooldown -= dt;
+            if (flailTimer > 0f) flailTimer -= dt;
+            if (holdHeadTimer > 0f) holdHeadTimer -= dt;
+            if (regripCooldown > 0f) regripCooldown -= dt;
             breathPhase += dt * v.BreathRate / 60f * Mathf.PI * 2f;
             BreathOffset = Mathf.Sin(breathPhase) * 1.6f * v.BreathDepth;
+            bal.ClearCommand();
 
-            // Global transitions
+            // global transitions
             if (v.Dead) SetState(MotorState.Dead);
             else if (!body.HeadAttached) SetState(MotorState.Headless);
             else if (v.Unconscious) { if (State != MotorState.Unconscious) SetState(MotorState.Unconscious); }
@@ -1321,8 +1598,10 @@ namespace RagdollSandbox
 
             bool zeroG = bal.G < 0.5f;
             if (zeroG && (State == MotorState.Stand || State == MotorState.Hop || State == MotorState.GetUp || State == MotorState.Crawl)) SetState(MotorState.Lie);
+            if (AnyGrip() && State != MotorState.Dead && State != MotorState.Unconscious && State != MotorState.Headless && State != MotorState.Hang && IsHanging()) SetState(MotorState.Hang);
 
             UpdateIntent(dt);
+            UpdateLimp();
 
             switch (State)
             {
@@ -1332,16 +1611,21 @@ namespace RagdollSandbox
                 case MotorState.Lie: TickLie(dt, zeroG); break;
                 case MotorState.GetUp: TickGetUp(dt); break;
                 case MotorState.Crawl: TickCrawl(dt); break;
+                case MotorState.Hang: TickHang(dt); break;
                 case MotorState.Headless: TickHeadless(dt); break;
-                case MotorState.Unconscious: TickLimp(dt, Sandbox.Boot.muscles.unconsciousTone); break;
-                case MotorState.Dead: TickLimp(dt, 1f); break;
+                case MotorState.Unconscious: TickLimp(dt); break;
+                case MotorState.Dead: TickLimp(dt); break;
             }
-            if (State != MotorState.Dead && State != MotorState.Unconscious && State != MotorState.Headless)
+            bool conscious = State != MotorState.Dead && State != MotorState.Unconscious && State != MotorState.Headless;
+            UpdateBehaviourWeights(dt, conscious);
+            if (conscious)
             {
-                Reactions(dt);
+                ApplyBehaviourLayers(dt);
                 Gaze(dt);
                 if (Possessed) PossessArms(dt);
+                GrabAndHold(dt);
             }
+            else { ReleaseGrip(0); ReleaseGrip(1); }
             if (grabbedPart != null) Struggle(dt);
         }
 
@@ -1362,13 +1646,15 @@ namespace RagdollSandbox
                 loc.Crouch = Input.crouch;
                 loc.DesiredYaw = mv.sqrMagnitude > 0.01f ? MathUtil.Yaw(mv) : Input.camYaw;
                 if (Input.jump) jumpLatch = true;
-                if (jumpLatch && (State == MotorState.Stand))
-                {
-                    loc.RequestJump();
-                    jumpLatch = false;
-                }
+                if (jumpLatch && State == MotorState.Stand) { loc.RequestJump(); jumpLatch = false; }
                 if (State != MotorState.Stand) jumpLatch = false;
                 Input.jump = false;
+                return;
+            }
+            if (ExternalControl)
+            {
+                loc.DesiredVelocity = ExternalVelocity;
+                if (ExternalVelocity.sqrMagnitude > 0.01f) loc.DesiredYaw = MathUtil.Yaw(ExternalVelocity);
                 return;
             }
             Vector3 target = Vector3.zero;
@@ -1403,7 +1689,6 @@ namespace RagdollSandbox
             else
             {
                 loc.DesiredVelocity = Vector3.zero;
-                // idle: turn to face the player when they walk around us
                 if (gs.gazeAtPlayer && Sandbox.MainCamera != null)
                 {
                     Vector3 toCam = MathUtil.Flat(Sandbox.MainCamera.transform.position - com);
@@ -1415,6 +1700,30 @@ namespace RagdollSandbox
                 }
             }
         }
+
+        /// <summary>Limping: a hurt (but usable) leg gets less stiffness and a shorter stance.</summary>
+        void UpdateLimp()
+        {
+            var loc = body.Locomotion;
+            loc.LimpSide = -1f;
+            loc.LimpAmount = 0f;
+            if (React <= 0f) return;
+            float worst = 0f;
+            int side = -1;
+            for (int s = 0; s < 2; s++)
+            {
+                if (!body.LegUsable[s]) continue;
+                var th = body.Part(s == 0 ? PartId.ThighL : PartId.ThighR);
+                var sh = body.Part(s == 0 ? PartId.ShinL : PartId.ShinR);
+                float h = Mathf.Min(th != null ? th.HealthFraction : 1f, sh != null ? sh.HealthFraction : 1f);
+                float hurt = Mathf.Clamp01((0.75f - h) / 0.5f);
+                if (hurt > worst) { worst = hurt; side = s; }
+            }
+            if (side < 0) return;
+            loc.LimpSide = side;
+            loc.LimpAmount = worst * React;
+            if (side == 0) body.Muscles.LegScaleL = 1f - worst * 0.35f; else body.Muscles.LegScaleR = 1f - worst * 0.35f;
+        }
         #endregion
 
         #region States
@@ -1423,6 +1732,7 @@ namespace RagdollSandbox
             var bal = body.Balance;
             var loc = body.Locomotion;
             var v = body.Vitals;
+            var bs = Sandbox.Boot.balance;
             if (!CanStand)
             {
                 if (CanHop) { SetState(MotorState.Hop); return; }
@@ -1430,13 +1740,18 @@ namespace RagdollSandbox
                 return;
             }
             loc.Mode = GaitMode.Normal;
-            loc.LegReach = LegReachFactor();
+            loc.LegReach = 1f;
             float strengthScale = Mathf.Clamp01(body.Muscles.ActiveLevel * v.MuscleFactor * (1f - v.Dizziness * 0.4f));
+            loc.Control = 1f - WFlail;
             bool supported = loc.Tick(dt, strengthScale);
-            bool fallen = !bal.Upright && !loc.Jumping;
-            bool lostSupport = bal.SupportCount == 0 && !loc.Jumping && StateTime > 0.3f && bal.PelvisHeight < bal.StandHeight * 0.75f;
-            bool unrecoverable = bal.SupportCount > 0 && StateTime > 0.5f && bal.SupportDistance > 0.55f * body.Scale && !loc.IsSwinging(0) && !loc.IsSwinging(1);
-            if (fallen || lostSupport || unrecoverable || !supported || body.Muscles.Stun > 0.25f)
+            // falling: torso tipped over, pelvis sunk, or the capture point unrecoverably outside the support
+            bool tipped = bal.Tilt > bs.fallAngle;
+            bool sunk = bal.PelvisHeight < bal.StandHeight * 0.58f && !loc.Jumping;
+            fallTimer = tipped ? fallTimer + dt : 0f;
+            lowTimer = sunk ? lowTimer + dt : 0f;
+            bool unrecoverable = bal.SupportCount > 0 && StateTime > 0.5f && bal.SupportDistance > bs.unrecoverableDistance * body.Scale && !loc.IsSwinging(0) && !loc.IsSwinging(1);
+            bool lost = bal.SupportCount == 0 && !loc.Jumping && StateTime > 0.4f && bal.PelvisHeight < bal.StandHeight * 0.7f;
+            if (fallTimer > 0.12f || lowTimer > 0.35f || unrecoverable || lost || !supported || body.Muscles.Stun > 0.25f || WFlail > 0.6f)
                 SetState(MotorState.Fall);
             if (v.Dizziness > 0.6f && rng.Value < dt * 0.2f) SetState(MotorState.Fall);
         }
@@ -1448,65 +1763,48 @@ namespace RagdollSandbox
             if (CanStand) { SetState(MotorState.Stand); return; }
             if (!CanHop) { SetState(MotorState.Fall); return; }
             loc.Mode = GaitMode.Hop;
-            loc.LegReach = LegReachFactor();
+            loc.LegReach = 1f;
             float strengthScale = Mathf.Clamp01(body.Muscles.ActiveLevel * body.Vitals.MuscleFactor);
             loc.Tick(dt, strengthScale);
             if (!bal.Upright && StateTime > 0.4f) SetState(MotorState.Fall);
-            if (bal.SupportDistance > 0.6f * body.Scale && StateTime > 0.5f) SetState(MotorState.Fall);
-        }
-
-        float LegReachFactor()
-        {
-            float r = 1f;
-            for (int s = 0; s < 2; s++)
-            {
-                PartId thigh = s == 0 ? PartId.ThighL : PartId.ThighR, shin = s == 0 ? PartId.ShinL : PartId.ShinR;
-                if (body.Has(thigh) && body.Part(thigh).fractured) r = Mathf.Min(r, 0.7f);
-                if (body.Has(shin) && body.Part(shin).fractured) r = Mathf.Min(r, 0.75f);
-            }
-            return r;
+            if (bal.SupportDistance > 0.6f * body.Scale && StateTime > 0.5f && !loc.Airborne) SetState(MotorState.Fall);
         }
 
         void TickFall(float dt)
         {
             var mus = body.Muscles;
             var bal = body.Balance;
-            // Tuck and protect the head with the arms, then go limp just before / at impact.
-            bool impact = Time.time - fallImpactTime < 0.6f;
-            mus.GlobalScale = impact ? 0.3f : 0.6f;
-            mus.Brace = impact ? 0f : 0.4f;
-            ProtectHead(0); ProtectHead(1);
-            mus.Set(PartId.Neck, Pose.SpineLocal(25f, 0f, 0f));
-            mus.Set(PartId.Head, Pose.SpineLocal(15f, 0f, 0f));
+            fallTimer += dt;
+            body.Locomotion.ResetFeet();
+            // tuck the chin and legs; arms brace (layer); go limp at the moment of impact
+            bool torsoContact = TorsoOnGround();
+            if (torsoContact && !impacted) { impacted = true; impactTime = Time.time; }
+            float sinceImpact = Time.time - impactTime;
+            bool limp = impacted && sinceImpact < 0.45f;
+            mus.GlobalScale = limp ? 0.22f : Mathf.Lerp(0.75f, 0.55f, Mathf.Clamp01(fallTimer));
+            mus.Brace = limp ? 0f : 0.35f;
+            mus.Set(PartId.Neck, Pose.SpineLocal(28f, 0f, 0f));
+            mus.Set(PartId.Head, Pose.SpineLocal(18f, 0f, 0f));
             mus.Set(PartId.Abdomen, Pose.SpineLocal(15f, 0f, 0f));
             mus.Set(PartId.Chest, Pose.SpineLocal(10f, 0f, 0f));
             for (int s = 0; s < 2; s++)
             {
                 float side = s == 0 ? -1f : 1f;
-                mus.Set(s == 0 ? PartId.ThighL : PartId.ThighR, Pose.HipLocal(side, 30f, 8f, 0f));
+                mus.Set(s == 0 ? PartId.ThighL : PartId.ThighR, Pose.HipLocal(side, 28f, 8f, 0f));
                 mus.Set(s == 0 ? PartId.ShinL : PartId.ShinR, Pose.KneeLocal(40f));
                 mus.Set(s == 0 ? PartId.FootL : PartId.FootR, Pose.AnkleLocal(10f, 0f));
             }
+            // relaxed arms as the base; the brace layer reaches for the ground
+            mus.Set(PartId.UpperArmL, Pose.ArmUpperLocal(-1f, 30f, 40f, 0f)); mus.Set(PartId.ForearmL, Pose.ElbowLocal(-1f, 30f, 0f));
+            mus.Set(PartId.UpperArmR, Pose.ArmUpperLocal(1f, 30f, 40f, 0f)); mus.Set(PartId.ForearmR, Pose.ElbowLocal(1f, 30f, 0f));
             float speed = body.ComVelocity.magnitude;
-            if (TorsoOnGround()) { if (fallImpactTime < Time.time - 2f) fallImpactTime = Time.time; }
-            if ((TorsoOnGround() && speed < 1.2f && StateTime > 0.4f) || StateTime > 3f) SetState(MotorState.Lie);
+            if ((torsoContact && speed < 1.2f && StateTime > 0.4f) || StateTime > 3.5f) SetState(MotorState.Lie);
         }
 
         bool TorsoOnGround()
         {
             return (body.Has(PartId.Chest) && body.Chest.Touching) || (body.Has(PartId.Pelvis) && body.Pelvis.Touching) ||
                    (body.Has(PartId.Abdomen) && body.Part(PartId.Abdomen).Touching) || (body.Has(PartId.Head) && body.Head.Touching);
-        }
-
-        void ProtectHead(int s)
-        {
-            if (!body.ArmUsable[s]) return;
-            float side = s == 0 ? -1f : 1f;
-            ArmOverride[s] = true;
-            var mus = body.Muscles;
-            mus.Set(s == 0 ? PartId.UpperArmL : PartId.UpperArmR, Pose.ArmUpperLocal(side, 25f, 115f, side * 20f));
-            mus.Set(s == 0 ? PartId.ForearmL : PartId.ForearmR, Pose.ElbowLocal(side, 125f, 0f));
-            mus.Set(s == 0 ? PartId.HandL : PartId.HandR, Pose.WristLocal(side, 10f, 0f));
         }
 
         void TickLie(float dt, bool zeroG)
@@ -1518,21 +1816,29 @@ namespace RagdollSandbox
             mus.GlobalScale = zeroG ? 0.6f : 0.4f;
             RelaxedPose(zeroG ? 0.4f : 0f);
             if (zeroG) return;
-            float will = Sandbox.Boot.vitals.willToLive;
-            float delay = bs.getUpDelay * Mathf.Lerp(2f, 0.7f, will) * (1f + body.Vitals.Pain);
+            float delay = bs.getUpDelay * Mathf.Lerp(2f, 0.7f, Will) * (1f + body.Vitals.Pain);
             if (lieQuietTime < delay) return;
-            if (CanStand && getUpAttempts < bs.getUpAttempts) { getUpAttempts++; SetState(MotorState.GetUp); return; }
-            if (CanHop && getUpAttempts < bs.getUpAttempts) { getUpAttempts++; SetState(MotorState.GetUp); return; }
-            if (CanCrawl && (!CanStand || getUpAttempts >= bs.getUpAttempts)) { SetState(MotorState.Crawl); return; }
-            // regain attempts slowly while resting
+            int attempts = Mathf.Max(0, bs.getUpAttempts - InjuryPenalty());
+            if (CanStand && getUpAttempts < attempts) { getUpAttempts++; SetState(MotorState.GetUp); return; }
+            if (CanHop && getUpAttempts < attempts) { getUpAttempts++; SetState(MotorState.GetUp); return; }
+            if (CanCrawl && (!CanStand || getUpAttempts >= attempts)) { SetState(MotorState.Crawl); return; }
             if (StateTime > 12f && getUpAttempts > 0) { getUpAttempts--; StateTime = 0f; }
+        }
+
+        int InjuryPenalty()
+        {
+            int p = 0;
+            for (int i = 0; i < PartInfo.Count; i++) p += body.FractureCount[i];
+            if (body.Vitals.BloodFraction < 0.8f) p++;
+            if (body.Vitals.Pain > 0.6f) p++;
+            return p;
         }
 
         void RelaxedPose(float floatiness)
         {
             var mus = body.Muscles;
-            if (!ArmOverride[0]) { mus.Set(PartId.UpperArmL, Pose.ArmUpperLocal(-1f, 18f + floatiness * 40f, 10f + floatiness * 30f, 0f)); mus.Set(PartId.ForearmL, Pose.ElbowLocal(-1f, 25f, 0f)); mus.Set(PartId.HandL, Quaternion.identity); }
-            if (!ArmOverride[1]) { mus.Set(PartId.UpperArmR, Pose.ArmUpperLocal(1f, 18f + floatiness * 40f, 10f + floatiness * 30f, 0f)); mus.Set(PartId.ForearmR, Pose.ElbowLocal(1f, 25f, 0f)); mus.Set(PartId.HandR, Quaternion.identity); }
+            mus.Set(PartId.UpperArmL, Pose.ArmUpperLocal(-1f, 18f + floatiness * 40f, 10f + floatiness * 30f, 0f)); mus.Set(PartId.ForearmL, Pose.ElbowLocal(-1f, 25f, 0f)); mus.Set(PartId.HandL, Quaternion.identity);
+            mus.Set(PartId.UpperArmR, Pose.ArmUpperLocal(1f, 18f + floatiness * 40f, 10f + floatiness * 30f, 0f)); mus.Set(PartId.ForearmR, Pose.ElbowLocal(1f, 25f, 0f)); mus.Set(PartId.HandR, Quaternion.identity);
             for (int s = 0; s < 2; s++)
             {
                 float side = s == 0 ? -1f : 1f;
@@ -1542,34 +1848,34 @@ namespace RagdollSandbox
             }
             mus.Set(PartId.Abdomen, Pose.SpineLocal(BreathOffset * 0.4f, 0f, 0f));
             mus.Set(PartId.Chest, Pose.SpineLocal(-BreathOffset, 0f, 0f));
-        }
-
-        void TickLimp(float dt, float scale)
-        {
-            var mus = body.Muscles;
-            mus.GlobalScale = 1f;
-            RelaxedPose(0f);
             mus.Set(PartId.Neck, Quaternion.identity);
             mus.Set(PartId.Head, Quaternion.identity);
+        }
+
+        void TickLimp(float dt)
+        {
+            body.Muscles.GlobalScale = 1f;
+            RelaxedPose(0f);
         }
 
         void TickHeadless(float dt)
         {
             var mus = body.Muscles;
             var v = body.Vitals;
-            // Erratic motor spasm that fades with blood loss.
             float drive = v.HeadlessDrive;
             mus.GlobalScale = 0.7f;
             mus.Spasm(drive * 1.1f);
             RelaxedPose(0f);
-            if (State == MotorState.Headless && body.Balance.Upright && body.LegUsable[0] && body.LegUsable[1] && drive > 0.5f)
+            if (body.Balance.Upright && body.LegUsable[0] && body.LegUsable[1] && drive > 0.5f)
             {
                 body.Locomotion.DesiredVelocity = body.Locomotion.Heading * Vector3.forward * 0.6f * drive;
+                body.Locomotion.Control = drive * 0.6f;
                 body.Locomotion.Tick(dt, drive * 0.6f);
             }
         }
 
-        /// <summary>Recovery: roll to prone, push up with the arms, bring the feet under, stand up. Time limited.</summary>
+        /// <summary>Recovery: roll to prone, push up with the arms, knees under the hips, rise. Every phase is driven by
+        /// the same bounded assist as standing (upright drives + support forces), ramped in so it never pops.</summary>
         void TickGetUp(float dt)
         {
             var bs = Sandbox.Boot.balance;
@@ -1581,90 +1887,84 @@ namespace RagdollSandbox
             getUpPhaseTime += dt;
             if (!CanStand && !CanHop) { SetState(CanCrawl ? MotorState.Crawl : MotorState.Lie); return; }
             if (StateTime > bs.getUpTimeout) { SetState(MotorState.Lie); return; }
-            float c = body.Vitals.Consciousness;
-            float weight = body.TotalMass * bal.G;
-            float assist = bs.getUpAssist * weight * c * Mathf.Lerp(0.4f, 1f, body.Vitals.MuscleFactor) * Sandbox.Boot.vitals.willToLive / 0.7f;
+            if (chest == null || !chest.attached) { SetState(MotorState.Lie); return; }
+            float assist = bs.getUpAssist * Mathf.Lerp(0.6f, 1.2f, Will) * Mathf.Lerp(0.5f, 1f, body.Vitals.MuscleFactor);
             Vector3 chestFwd = chest.rb.rotation * Vector3.forward;
-            Vector3 chestUp = chest.rb.rotation * Vector3.up;
             Vector3 bodyAxis = MathUtil.SafeNormal(chest.rb.position - pelvis.rb.position, Vector3.up);
-            Vector3 headingDir = MathUtil.SafeNormal(MathUtil.Flat(bodyAxis), MathUtil.Flat(chestUp));
+            Vector3 headingDir = MathUtil.SafeNormal(MathUtil.Flat(bodyAxis), MathUtil.Flat(chest.rb.rotation * Vector3.up));
             if (headingDir.sqrMagnitude < 0.01f) headingDir = Vector3.forward;
+            Quaternion H = Quaternion.LookRotation(headingDir, Vector3.up);
             float chestH = chest.rb.worldCenterOfMass.y - bal.GroundHeight;
             float pelvisH = pelvis.rb.worldCenterOfMass.y - bal.GroundHeight;
+            float ramp = Mathf.Clamp01(getUpPhaseTime / 0.35f);
             mus.GlobalScale = 1f;
             mus.Brace = 0.3f;
+            var cmd = new BalanceCommand();
+            cmd.pelvisTarget = pelvis.rb.rotation;
+            cmd.chestTarget = chest.rb.rotation;
+            cmd.velocityTarget = Vector3.zero;
+            cmd.velocityWeight = 0.3f;
 
-            switch (getUpPhase)
+            switch (GetUpPhase)
             {
-                case 0: // roll to prone
+                case 0: // roll to prone (face down) unless already prone or sitting up
                     {
                         float faceUp = Vector3.Dot(chestFwd, Vector3.up);
-                        if (faceUp < -0.35f || (chestH > 0.3f * s && bal.Tilt < 70f)) { NextGetUpPhase(); break; }
-                        Vector3 rollAxis = bodyAxis;
-                        float dir = Vector3.Dot(Vector3.Cross(chestFwd, Vector3.down), rollAxis) >= 0f ? 1f : -1f;
-                        bal.Assist(chest.rb, rollAxis * dir * 140f * body.MassScale, 1.2f);
-                        bal.Assist(pelvis.rb, rollAxis * dir * 90f * body.MassScale, 1.2f);
+                        if (faceUp < -0.4f || (chestH > 0.32f * s && bal.Tilt < 70f)) { NextGetUpPhase(); break; }
+                        float dir = Vector3.Dot(Vector3.Cross(chestFwd, Vector3.down), bodyAxis) >= 0f ? 1f : -1f;
+                        Quaternion roll = Quaternion.AngleAxis(dir * 100f, bodyAxis);
+                        cmd.pelvisTarget = roll * pelvis.rb.rotation;
+                        cmd.chestTarget = roll * chest.rb.rotation;
+                        cmd.upright = 0.6f * ramp; cmd.chestUpright = 0.8f * ramp;
+                        cmd.control = assist;
                         int reach = dir > 0f ? 1 : 0;
-                        ArmOverride[reach] = true;
                         float side = reach == 0 ? -1f : 1f;
-                        mus.Set(reach == 0 ? PartId.UpperArmL : PartId.UpperArmR, Pose.ArmUpperLocal(side, -20f, 100f, 0f));
-                        mus.Set(reach == 0 ? PartId.ForearmL : PartId.ForearmR, Pose.ElbowLocal(side, 20f, 0f));
+                        mus.Blend(reach == 0 ? PartId.UpperArmL : PartId.UpperArmR, Pose.ArmUpperLocal(side, -20f, 100f, 0f), 1f);
+                        mus.Blend(reach == 0 ? PartId.ForearmL : PartId.ForearmR, Pose.ElbowLocal(side, 20f, 0f), 1f);
                         int leg = 1 - reach;
                         mus.Set(leg == 0 ? PartId.ThighL : PartId.ThighR, Pose.HipLocal(leg == 0 ? -1f : 1f, 60f, -15f, 0f));
                         mus.Set(leg == 0 ? PartId.ShinL : PartId.ShinR, Pose.KneeLocal(80f));
-                        if (getUpPhaseTime > 2.2f) NextGetUpPhase();
+                        if (getUpPhaseTime > 2f) NextGetUpPhase();
                         break;
                     }
-                case 1: // push up with the arms
+                case 1: // push up with the arms (chest up, torso pitched forward)
                     {
                         PushUpArms(headingDir, 0.5f);
-                        mus.Set(PartId.Neck, Pose.SpineLocal(-30f, 0f, 0f));
-                        mus.Set(PartId.Head, Pose.SpineLocal(-20f, 0f, 0f));
-                        float target = 0.5f * s;
-                        float lift = HandSupportLift(chest, target, chestH, assist);
-                        Quaternion chestTarget = Quaternion.LookRotation(headingDir, Vector3.up) * Quaternion.Euler(55f, 0f, 0f);
-                        bal.Assist(chest.rb, BalanceController.UprightTorque(chest.rb, chestTarget, 300f, 40f), 1.3f);
-                        LegsTuck(0.4f);
+                        mus.Set(PartId.Neck, Pose.SpineLocal(-28f, 0f, 0f));
+                        mus.Set(PartId.Head, Pose.SpineLocal(-18f, 0f, 0f));
+                        LegsTuck(0.45f);
+                        cmd.chestTarget = H * Quaternion.Euler(Mathf.Lerp(85f, 55f, ramp), 0f, 0f);
+                        cmd.pelvisTarget = H * Quaternion.Euler(80f, 0f, 0f);
+                        cmd.upright = 0.4f * ramp; cmd.chestUpright = ramp;
+                        cmd.liftChest = 1f; cmd.chestHeightTarget = bal.GroundHeight + 0.5f * s;
+                        cmd.control = assist;
                         if (chestH > 0.42f * s && getUpPhaseTime > 0.4f) NextGetUpPhase();
-                        if (getUpPhaseTime > 2.6f) NextGetUpPhase();
+                        if (getUpPhaseTime > 2.4f) NextGetUpPhase();
                         break;
                     }
-                case 2: // knees under the hips (kneel)
+                case 2: // knees under the hips (kneel / crouch)
                     {
                         PushUpArms(headingDir, 0.8f);
                         LegsTuck(1f);
-                        float lift = HandSupportLift(chest, 0.62f * s, chestH, assist);
-                        // pelvis up, reacting against shins/knees on the ground
-                        float fy = body.TotalMass * 0.45f * (bal.G * 0.6f + 120f * (0.5f * s - pelvisH) - 15f * Compat.GetVelocity(pelvis.rb).y);
-                        fy = Mathf.Clamp(fy, 0f, weight * 0.9f);
-                        int pushers = 0;
-                        for (int k = 0; k < 2; k++) { var sh = body.Part(k == 0 ? PartId.ShinL : PartId.ShinR); if (sh != null && sh.attached && sh.Touching) pushers++; }
-                        if (pushers > 0)
-                        {
-                            for (int k = 0; k < 2; k++)
-                            {
-                                var sh = body.Part(k == 0 ? PartId.ShinL : PartId.ShinR);
-                                if (sh != null && sh.attached && sh.Touching) BalanceController.PairForce(pelvis.rb, Vector3.up * fy / pushers, sh.rb);
-                            }
-                        }
-                        pelvis.rb.AddForce(Vector3.up * Mathf.Min(assist * 0.5f, Mathf.Max(0f, fy * 0.5f)), ForceMode.Force);
-                        Quaternion pTarget = Quaternion.LookRotation(headingDir, Vector3.up) * Quaternion.Euler(20f, 0f, 0f);
-                        bal.Assist(pelvis.rb, BalanceController.UprightTorque(pelvis.rb, pTarget, 260f, 35f), 1.3f);
+                        cmd.chestTarget = H * Quaternion.Euler(Mathf.Lerp(55f, 35f, ramp), 0f, 0f);
+                        cmd.pelvisTarget = H * Quaternion.Euler(Mathf.Lerp(70f, 35f, ramp), 0f, 0f);
+                        cmd.upright = ramp; cmd.chestUpright = ramp;
+                        cmd.heightTarget = bal.GroundHeight + 0.5f * s;
+                        cmd.heightWeight = 0.7f; cmd.lift = 0.5f;
+                        cmd.liftChest = 0.5f; cmd.chestHeightTarget = bal.GroundHeight + 0.75f * s;
+                        cmd.control = assist;
                         if (pelvisH > 0.42f * s && getUpPhaseTime > 0.5f) NextGetUpPhase();
-                        if (getUpPhaseTime > 2.8f) NextGetUpPhase();
+                        if (getUpPhaseTime > 2.6f) NextGetUpPhase();
                         break;
                     }
                 case 3: // rise to standing
                     {
-                        float u = Mathf.Clamp01(getUpPhaseTime / 1.4f);
-                        float hTarget = Mathf.Lerp(0.55f * s, bal.StandHeight, u);
-                        Quaternion H = Quaternion.LookRotation(headingDir, Vector3.up);
-                        Quaternion pTarget = H * Quaternion.Euler(Mathf.Lerp(30f, 0f, u), 0f, 0f);
-                        Quaternion cTarget = H * Quaternion.Euler(Mathf.Lerp(45f, 0f, u), 0f, 0f);
+                        float u = Mathf.Clamp01(getUpPhaseTime / 1.3f);
+                        float hTarget = bal.GroundHeight + Mathf.Lerp(0.55f * s, bal.StandHeight, u);
                         for (int k = 0; k < 2; k++)
                         {
                             float side = k == 0 ? -1f : 1f;
-                            float flex = Mathf.Lerp(95f, 10f, u), knee = Mathf.Lerp(120f, 10f, u);
+                            float flex = Mathf.Lerp(95f, 8f, u), knee = Mathf.Lerp(120f, 8f, u);
                             mus.Set(k == 0 ? PartId.ThighL : PartId.ThighR, Pose.HipLocal(side, flex, 6f, 0f));
                             mus.Set(k == 0 ? PartId.ShinL : PartId.ShinR, Pose.KneeLocal(knee));
                             mus.Set(k == 0 ? PartId.FootL : PartId.FootR, Pose.AnkleLocal(Mathf.Lerp(-20f, 0f, u), 0f));
@@ -1672,19 +1972,14 @@ namespace RagdollSandbox
                         mus.Set(PartId.Abdomen, Pose.SpineLocal(Mathf.Lerp(25f, 0f, u), 0f, 0f));
                         mus.Set(PartId.Chest, Pose.SpineLocal(Mathf.Lerp(20f, 0f, u), 0f, 0f));
                         ArmsForward(Mathf.Lerp(60f, 10f, u));
-                        float fy = body.TotalMass * (bal.G + 140f * (hTarget - pelvisH) - 20f * Compat.GetVelocity(pelvis.rb).y);
-                        fy = Mathf.Clamp(fy, 0f, weight * 1.6f) * Mathf.Clamp01(Mathf.Min(body.Muscles.LegStrength(0), body.Muscles.LegStrength(1)) * 1.3f + 0.2f);
-                        int feetDown = 0;
-                        for (int k = 0; k < 2; k++) if (bal.FootPart[k] != null && bal.FootPart[k].Touching) feetDown++;
-                        if (feetDown > 0)
-                        {
-                            for (int k = 0; k < 2; k++)
-                                if (bal.FootPart[k] != null && bal.FootPart[k].Touching) BalanceController.PairForce(pelvis.rb, Vector3.up * fy / feetDown, bal.FootPart[k].rb);
-                        }
-                        pelvis.rb.AddForce(Vector3.up * Mathf.Min(assist, fy), ForceMode.Force);
-                        bal.Assist(pelvis.rb, BalanceController.UprightTorque(pelvis.rb, pTarget, 600f, 70f), 1.5f);
-                        bal.Assist(chest.rb, BalanceController.UprightTorque(chest.rb, cTarget, 450f, 50f), 1.5f);
-                        if (pelvisH > bal.StandHeight * 0.86f && bal.Tilt < 30f)
+                        cmd.pelvisTarget = H * Quaternion.Euler(Mathf.Lerp(30f, 0f, u), 0f, 0f);
+                        cmd.chestTarget = H * Quaternion.Euler(Mathf.Lerp(40f, 0f, u), 0f, 0f);
+                        cmd.upright = 1f; cmd.chestUpright = 1f;
+                        cmd.heightTarget = hTarget; cmd.heightWeight = 1f; cmd.lift = Sandbox.Boot.balance.weightSupport;
+                        cmd.centerTarget = bal.SupportCount > 0 ? bal.SupportCenter : MathUtil.Flat(body.CenterOfMass);
+                        cmd.centerWeight = 0.6f;
+                        cmd.control = assist;
+                        if (pelvisH > bal.StandHeight * 0.86f && bal.Tilt < 28f)
                         {
                             body.Locomotion.HeadingYaw = MathUtil.Yaw(headingDir);
                             body.Locomotion.DesiredYaw = body.Locomotion.HeadingYaw;
@@ -1695,13 +1990,13 @@ namespace RagdollSandbox
                         break;
                     }
             }
+            if (State == MotorState.GetUp) bal.Cmd = cmd;
         }
 
-        void NextGetUpPhase() { getUpPhase++; getUpPhaseTime = 0f; }
+        void NextGetUpPhase() { GetUpPhase++; getUpPhaseTime = 0f; }
 
         void PushUpArms(Vector3 heading, float extension)
         {
-            var chest = body.Chest;
             float s = body.Scale;
             Vector3 right = new Vector3(heading.z, 0f, -heading.x);
             for (int k = 0; k < 2; k++)
@@ -1711,39 +2006,8 @@ namespace RagdollSandbox
                 PartId up = k == 0 ? PartId.UpperArmL : PartId.UpperArmR;
                 Vector3 shoulder = body.Part(up).rb.position;
                 Vector3 hand = new Vector3(shoulder.x, body.Balance.GroundHeight + 0.05f * s, shoulder.z) + heading * 0.12f * s + right * side * 0.12f * s;
-                ArmIK(k, hand, Vector3.up * 0.3f + right * side - heading * 0.2f, 1f, 1.2f + extension);
+                ArmIK(k, hand, Vector3.up * 0.3f + right * side - heading * 0.2f, 1f, 1.2f + extension, 1f);
             }
-        }
-
-        float HandSupportLift(BodyPart chest, float target, float current, float assist)
-        {
-            var bal = body.Balance;
-            float upper = body.TotalMass * 0.55f;
-            float fy = upper * (bal.G * 0.7f + 110f * (target - current) - 14f * Compat.GetVelocity(chest.rb).y);
-            fy = Mathf.Clamp(fy, 0f, upper * bal.G * 1.4f);
-            int hands = 0;
-            for (int k = 0; k < 2; k++)
-            {
-                if (!body.ArmUsable[k]) continue;
-                var h = body.Part(k == 0 ? PartId.HandL : PartId.HandR);
-                var fa = body.Part(k == 0 ? PartId.ForearmL : PartId.ForearmR);
-                if ((h != null && h.attached && h.Touching) || (fa != null && fa.Touching)) hands++;
-            }
-            float armStr = Mathf.Max(body.Muscles.ArmStrength(0), body.Muscles.ArmStrength(1));
-            fy *= Mathf.Clamp01(armStr * 1.4f + 0.15f);
-            if (hands > 0)
-            {
-                for (int k = 0; k < 2; k++)
-                {
-                    if (!body.ArmUsable[k]) continue;
-                    var h = body.Part(k == 0 ? PartId.HandL : PartId.HandR);
-                    var fa = body.Part(k == 0 ? PartId.ForearmL : PartId.ForearmR);
-                    BodyPart contact = h != null && h.attached && h.Touching ? h : (fa != null && fa.Touching ? fa : null);
-                    if (contact != null) BalanceController.PairForce(chest.rb, Vector3.up * fy / hands, contact.rb);
-                }
-            }
-            chest.rb.AddForce(Vector3.up * Mathf.Min(assist * 0.5f, fy * 0.6f), ForceMode.Force);
-            return fy;
         }
 
         void LegsTuck(float amount)
@@ -1764,15 +2028,14 @@ namespace RagdollSandbox
             var mus = body.Muscles;
             for (int k = 0; k < 2; k++)
             {
-                if (ArmOverride[k]) continue;
                 float side = k == 0 ? -1f : 1f;
-                ArmOverride[k] = true;
                 mus.Set(k == 0 ? PartId.UpperArmL : PartId.UpperArmR, Pose.ArmUpperLocal(side, 20f, flex, 0f));
                 mus.Set(k == 0 ? PartId.ForearmL : PartId.ForearmR, Pose.ElbowLocal(side, 30f, 0f));
             }
         }
 
-        /// <summary>Army crawl with a procedural arm step planner: reach, plant, pull.</summary>
+        /// <summary>Army crawl (both legs gone or paralysed, or too hurt to stand) with an arm step planner. With one
+        /// usable leg the leg pushes too (drag gait).</summary>
         void TickCrawl(float dt)
         {
             var mus = body.Muscles;
@@ -1781,32 +2044,42 @@ namespace RagdollSandbox
             var pelvis = body.Pelvis;
             float s = body.Scale;
             if (CanStand && body.Vitals.Consciousness > 0.6f && StateTime > 3f) { SetState(MotorState.GetUp); return; }
-            if (!CanCrawl) { SetState(MotorState.Lie); return; }
+            if (CanHop && StateTime > 4f && Will > 0.5f) { SetState(MotorState.GetUp); return; }
+            if (!CanCrawl || chest == null || !chest.attached) { SetState(MotorState.Lie); return; }
             Vector3 chestFwd = chest.rb.rotation * Vector3.forward;
-            // must be prone: roll over first
+            Vector3 bodyAxis = MathUtil.SafeNormal(chest.rb.position - pelvis.rb.position, Vector3.forward);
             if (Vector3.Dot(chestFwd, Vector3.up) > 0.2f)
             {
-                Vector3 axis = MathUtil.SafeNormal(chest.rb.position - pelvis.rb.position, Vector3.forward);
-                bal.Assist(chest.rb, axis * 120f * body.MassScale, 1.2f);
+                // must be prone: roll over with the bounded assist
+                var rc = new BalanceCommand();
+                Quaternion roll = Quaternion.AngleAxis(100f, bodyAxis);
+                rc.chestTarget = roll * chest.rb.rotation; rc.pelvisTarget = roll * pelvis.rb.rotation;
+                rc.upright = 0.5f; rc.chestUpright = 0.8f; rc.control = Sandbox.Boot.balance.getUpAssist;
+                bal.Cmd = rc;
                 return;
             }
-            Vector3 bodyDir = MathUtil.SafeNormal(MathUtil.Flat(chest.rb.position - pelvis.rb.position), MathUtil.Flat(chest.rb.rotation * Vector3.up));
+            Vector3 bodyDir = MathUtil.SafeNormal(MathUtil.Flat(bodyAxis), MathUtil.Flat(chest.rb.rotation * Vector3.up));
             Vector3 goal = Possessed ? Input.move : (HasCommand ? MathUtil.Flat(CommandTarget - chest.rb.position) :
                 (Sandbox.MainCamera != null ? MathUtil.Flat(Sandbox.MainCamera.transform.position - chest.rb.position) : bodyDir));
+            if (ExternalControl) goal = ExternalVelocity;
             Vector3 dir = goal.sqrMagnitude > 0.04f ? goal.normalized : Vector3.zero;
-            if (!Possessed && goal.magnitude < 1.2f) dir = Vector3.zero;
-            // steer: bounded yaw assist toward the goal
+            if (!Possessed && !ExternalControl && goal.magnitude < 1.2f) dir = Vector3.zero;
+            var cmd = new BalanceCommand();
+            cmd.chestTarget = chest.rb.rotation; cmd.pelvisTarget = pelvis.rb.rotation;
             if (dir.sqrMagnitude > 0f)
             {
-                float yawErr = Vector3.SignedAngle(bodyDir, dir, Vector3.up);
-                bal.Assist(chest.rb, Vector3.up * Mathf.Clamp(yawErr, -40f, 40f) * 2.2f * body.MassScale, 0.8f);
+                // steer: bounded yaw drive toward the goal, torso kept flat
+                Quaternion yawTo = Quaternion.LookRotation(dir, Vector3.up) * Quaternion.Euler(90f, 0f, 0f);
+                cmd.chestTarget = Quaternion.Slerp(chest.rb.rotation, yawTo, 0.5f);
+                cmd.chestUpright = 0.35f;
+                cmd.control = Sandbox.Boot.balance.getUpAssist * 0.6f;
             }
             else dir = bodyDir;
+            bal.Cmd = cmd;
             mus.Set(PartId.Neck, Pose.SpineLocal(-35f, 0f, 0f));
             mus.Set(PartId.Head, Pose.SpineLocal(-25f, 0f, 0f));
             mus.Set(PartId.Chest, Pose.SpineLocal(-8f, 0f, 0f));
             mus.Set(PartId.Abdomen, Pose.SpineLocal(-5f, 0f, 0f));
-            // legs: limp if paralysed / missing, otherwise frog pushes
             for (int k = 0; k < 2; k++)
             {
                 float side = k == 0 ? -1f : 1f;
@@ -1828,19 +2101,16 @@ namespace RagdollSandbox
             if (crawlPhase == 0)
             {
                 Vector3 reach = new Vector3(shoulder.x, bal.GroundHeight + 0.04f * s, shoulder.z) + dir * 0.45f * s + right * side2 * 0.12f * s;
-                ArmIK(arm, reach, Vector3.up + right * side2, 0.9f, 1f);
+                ArmIK(arm, reach, Vector3.up + right * side2, 0.9f, 1f, 1f);
                 if (crawlTimer > 0.55f) { crawlPhase = 1; crawlTimer = 0f; }
             }
             else
             {
                 Vector3 pull = new Vector3(shoulder.x, bal.GroundHeight + 0.04f * s, shoulder.z) - dir * 0.1f * s + right * side2 * 0.18f * s;
-                ArmIK(arm, pull, Vector3.up + right * side2 - dir, 1f, 1.3f);
+                ArmIK(arm, pull, Vector3.up + right * side2 - dir, 1f, 1.3f, 1f);
                 BodyPart contact = hand != null && hand.attached && hand.Touching ? hand : (fore != null && fore.Touching ? fore : null);
-                float f = Sandbox.Boot.locomotion.crawlForce * Mathf.Clamp01(strength * 1.3f + 0.1f) * body.MassScale * Mathf.Lerp(0.5f, 1f, Sandbox.Boot.vitals.willToLive);
-                if (contact != null)
-                {
-                    BalanceController.PairForce(chest.rb, dir * f + Vector3.up * f * 0.3f, contact.rb);
-                }
+                float f = Sandbox.Boot.locomotion.crawlForce * Mathf.Clamp01(strength * 1.3f + 0.1f) * body.MassScale * Mathf.Lerp(0.5f, 1f, Will);
+                if (contact != null) BalanceController.PairForce(chest.rb, dir * f + Vector3.up * f * 0.3f, contact.rb);
                 if (crawlTimer > 0.65f)
                 {
                     crawlPhase = 0; crawlTimer = 0f;
@@ -1849,23 +2119,233 @@ namespace RagdollSandbox
                 }
             }
             int other = 1 - arm;
-            if (body.ArmUsable[other] && !ArmOverride[other])
+            if (body.ArmUsable[other])
             {
                 Vector3 sh = body.Part(other == 0 ? PartId.UpperArmL : PartId.UpperArmR).rb.position;
-                ArmIK(other, new Vector3(sh.x, bal.GroundHeight + 0.05f * s, sh.z) + dir * 0.2f * s + right * (other == 0 ? -1f : 1f) * 0.15f * s,
-                    Vector3.up, 0.9f, 0.8f);
+                ArmIK(other, new Vector3(sh.x, bal.GroundHeight + 0.05f * s, sh.z) + dir * 0.2f * s + right * (other == 0 ? -1f : 1f) * 0.15f * s, Vector3.up, 0.9f, 0.8f, 1f);
             }
+        }
+
+        /// <summary>Hanging by the hands from a ledge / pole / car: legs dangle and kick, grip drains.</summary>
+        void TickHang(float dt)
+        {
+            var mus = body.Muscles;
+            if (!AnyGrip()) { SetState(TorsoOnGround() ? MotorState.Lie : MotorState.Fall); return; }
+            if (body.Balance.SupportCount > 0 && body.Balance.PelvisHeight > body.Balance.StandHeight * 0.8f && CanStand) { ReleaseGrip(0); ReleaseGrip(1); SetState(MotorState.Stand); return; }
+            mus.GlobalScale = 0.8f;
+            float kick = Mathf.Sin(StateTime * 5f) * 25f * Mathf.Clamp01(Will);
+            for (int s = 0; s < 2; s++)
+            {
+                float side = s == 0 ? -1f : 1f;
+                mus.Set(s == 0 ? PartId.ThighL : PartId.ThighR, Pose.HipLocal(side, 15f + kick * (s == 0 ? 1f : -1f), 6f, 0f));
+                mus.Set(s == 0 ? PartId.ShinL : PartId.ShinR, Pose.KneeLocal(25f + Mathf.Abs(kick)));
+                mus.Set(s == 0 ? PartId.FootL : PartId.FootR, Pose.AnkleLocal(20f, 0f));
+            }
+            mus.Set(PartId.Abdomen, Pose.SpineLocal(5f, 0f, 0f));
+            mus.Set(PartId.Chest, Pose.SpineLocal(0f, 0f, 0f));
         }
         #endregion
 
-        #region Arms, reactions, gaze
-        /// <summary>Arm IK: drives shoulder/elbow/wrist targets so the hand reaches 'target'. elbowHint is the elbow direction.</summary>
-        public void ArmIK(int k, Vector3 target, Vector3 elbowHint, float reach, float stiffness)
+        #region Behaviour layers (Euphoria-style blending)
+        void UpdateBehaviourWeights(float dt, bool conscious)
         {
-            if (!body.ArmUsable[k]) return;
+            float react = React;
+            var bal = body.Balance;
+            var v = body.Vitals;
+            float rate = 4f * dt;
+            // stagger: capture point outside the support while standing -> windmill arms, widen stance
+            float stagger = State == MotorState.Stand || State == MotorState.Hop ? Mathf.Clamp01(body.Locomotion.RecoveryUrgency * 1.6f + (body.Locomotion.StumbleTimer > 0f ? 0.6f : 0f)) : 0f;
+            WStagger = Mathf.MoveTowards(WStagger, conscious ? stagger * react : 0f, rate * 2f);
+            body.Locomotion.WidenStance = WStagger * 0.1f;
+            // brace: falling toward a surface
+            float brace = 0f;
+            if (State == MotorState.Fall && conscious)
+            {
+                braceHasTarget = PredictImpact(out braceTarget);
+                brace = impacted && Time.time - impactTime < 0.45f ? 0.2f : 1f;
+            }
+            WBrace = Mathf.MoveTowards(WBrace, brace * react, rate * 3f);
+            WProtect = Mathf.MoveTowards(WProtect, shieldTimer > 0f && conscious ? react : 0f, rate * 3f);
+            WFlail = Mathf.MoveTowards(WFlail, flailTimer > 0f && conscious ? react : 0f, rate * 4f);
+            // clutching / hunching / holding the head
+            UpdateClutch(dt, conscious);
+            WClutch = Mathf.MoveTowards(WClutch, clutchTimer > 0f && conscious ? react : 0f, rate);
+            float gut = conscious ? GutPain() : 0f;
+            WHunch = Mathf.MoveTowards(WHunch, gut * react, rate * 0.5f);
+            body.Locomotion.Hunch = WHunch * 22f;
+            if (conscious && v.HeadTrauma > 0.3f && holdHeadTimer <= 0f && rng.Value < dt * 0.15f) holdHeadTimer = rng.Range(2f, 4f);
+            WHoldHead = Mathf.MoveTowards(WHoldHead, holdHeadTimer > 0f && conscious ? react : 0f, rate);
+            WStruggle = Mathf.MoveTowards(WStruggle, grabbedPart != null && conscious ? react : 0f, rate);
+        }
+
+        float GutPain()
+        {
+            float r = 0f;
+            var list = body.Wounds.Wounds;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var w = list[i];
+                if (!w.Active || w.part == null || !w.part.attached) continue;
+                if (w.part.id == PartId.Abdomen || w.part.id == PartId.Pelvis) r = Mathf.Max(r, Mathf.Clamp01(w.severity + w.depth * 8f));
+            }
+            return r;
+        }
+
+        /// <summary>Where the body is about to hit: a ray along the fall direction from the chest.</summary>
+        bool PredictImpact(out Vector3 point)
+        {
+            point = Vector3.zero;
+            var chest = body.Chest;
+            if (chest == null) return false;
+            Vector3 v = body.ComVelocity + Physics.gravity * 0.25f;
+            Vector3 dir = MathUtil.SafeNormal(v, Vector3.down);
+            RaycastHit hit;
+            if (Physics.Raycast(chest.rb.position, dir, out hit, 2.5f * body.Scale, Layers.GroundMask, QueryTriggerInteraction.Ignore))
+            {
+                BodyPart bp = Registry.PartOf(hit.collider);
+                if (bp != null && bp.body == body) return false;
+                point = hit.point;
+                return true;
+            }
+            point = chest.rb.position + dir * 1.2f * body.Scale;
+            return true;
+        }
+
+        void ApplyBehaviourLayers(float dt)
+        {
+            var mus = body.Muscles;
+            float s = body.Scale;
+            var chest = body.Chest;
+            if (chest == null || !chest.attached) return;
+            // stagger: arms windmill, slight crouch via wider stance
+            if (WStagger > 0.01f)
+            {
+                float t = Time.time * 7f;
+                for (int k = 0; k < 2; k++)
+                {
+                    float side = k == 0 ? -1f : 1f;
+                    float ph = t + k * Mathf.PI;
+                    mus.Blend(k == 0 ? PartId.UpperArmL : PartId.UpperArmR, Pose.ArmUpperLocal(side, 70f + Mathf.Sin(ph) * 25f, 30f + Mathf.Cos(ph) * 50f, 0f), WStagger, 1.1f);
+                    mus.Blend(k == 0 ? PartId.ForearmL : PartId.ForearmR, Pose.ElbowLocal(side, 30f, 0f), WStagger);
+                }
+            }
+            // vehicle hit: flailing limbs
+            if (WFlail > 0.01f)
+            {
+                float t = Time.time * 11f;
+                for (int k = 0; k < 2; k++)
+                {
+                    float side = k == 0 ? -1f : 1f;
+                    mus.Blend(k == 0 ? PartId.UpperArmL : PartId.UpperArmR, Pose.ArmUpperLocal(side, 80f + Mathf.Sin(t + k) * 60f, Mathf.Cos(t * 1.3f + k) * 90f, 0f), WFlail);
+                    mus.Blend(k == 0 ? PartId.ForearmL : PartId.ForearmR, Pose.ElbowLocal(side, 40f + Mathf.Sin(t * 0.7f) * 40f, 0f), WFlail);
+                    mus.Blend(k == 0 ? PartId.ThighL : PartId.ThighR, Pose.HipLocal(side, 30f + Mathf.Sin(t * 0.9f + k * 2f) * 40f, 10f, 0f), WFlail * 0.8f);
+                    mus.Blend(k == 0 ? PartId.ShinL : PartId.ShinR, Pose.KneeLocal(40f + Mathf.Sin(t + k) * 35f), WFlail * 0.8f);
+                }
+            }
+            // clutch a wound with the free hand
+            if (WClutch > 0.01f && clutchWound != null && clutchWound.Active && clutchHand >= 0 && body.ArmUsable[clutchHand] && clutchWound.part != null)
+            {
+                Vector3 p = clutchWound.WorldPosition + clutchWound.WorldNormal * 0.035f * s;
+                float side = clutchHand == 0 ? -1f : 1f;
+                ArmIK(clutchHand, p, Vector3.down + chest.rb.rotation * (Vector3.right * side) * 0.6f + Vector3.back * 0.3f, 1f, 1f, WClutch);
+                clutchWound.part.bloodiness = 1f;
+                var hp = body.Part(clutchHand == 0 ? PartId.HandL : PartId.HandR);
+                if (hp != null) hp.bloodiness = 1f;
+            }
+            // hold the head after head trauma
+            if (WHoldHead > 0.01f && body.Head != null && body.Head.attached)
+            {
+                int k = body.ArmUsable[1] ? 1 : 0;
+                if (body.ArmUsable[k] && k != clutchHand)
+                {
+                    float side = k == 0 ? -1f : 1f;
+                    Vector3 p = body.Head.rb.position + body.Head.rb.rotation * (new Vector3(side * 0.09f, 0.08f, 0.02f) * s);
+                    ArmIK(k, p, Vector3.down + chest.rb.rotation * Vector3.right * side, 1f, 0.9f, WHoldHead);
+                }
+            }
+            // hunch over after gut hits
+            if (WHunch > 0.01f)
+            {
+                mus.Blend(PartId.Abdomen, Pose.SpineLocal(22f, 0f, 0f), WHunch);
+                mus.Blend(PartId.Chest, Pose.SpineLocal(15f, 0f, 0f), WHunch);
+                mus.Blend(PartId.Neck, Pose.SpineLocal(15f, 0f, 0f), WHunch * 0.6f);
+            }
+            // brace for impact: hands toward the predicted impact point, chin tucked
+            if (WBrace > 0.01f)
+            {
+                Vector3 target = braceHasTarget ? braceTarget : chest.rb.position + Vector3.down * 0.8f * s;
+                Vector3 right = chest.rb.rotation * Vector3.right;
+                for (int k = 0; k < 2; k++)
+                {
+                    if (!body.ArmUsable[k] || WGrab[k] > 0.5f) continue;
+                    float side = k == 0 ? -1f : 1f;
+                    Vector3 p = target + right * side * 0.18f * s + Vector3.up * 0.05f * s;
+                    ArmIK(k, p, Vector3.up * 0.4f + right * side, 1f, 1.1f, WBrace);
+                }
+                mus.Blend(PartId.Neck, Pose.SpineLocal(30f, 0f, 0f), WBrace);
+                mus.Blend(PartId.Head, Pose.SpineLocal(20f, 0f, 0f), WBrace);
+            }
+            // protect the head (explosions, incoming hits)
+            if (WProtect > 0.01f)
+            {
+                for (int k = 0; k < 2; k++)
+                {
+                    if (!body.ArmUsable[k]) continue;
+                    float side = k == 0 ? -1f : 1f;
+                    mus.Blend(k == 0 ? PartId.UpperArmL : PartId.UpperArmR, Pose.ArmUpperLocal(side, 25f, 115f, side * 20f), WProtect, 1.2f);
+                    mus.Blend(k == 0 ? PartId.ForearmL : PartId.ForearmR, Pose.ElbowLocal(side, 125f, 0f), WProtect, 1.2f);
+                    mus.Blend(k == 0 ? PartId.HandL : PartId.HandR, Pose.WristLocal(side, 10f, 0f), WProtect);
+                }
+                mus.Brace = Mathf.Max(mus.Brace, 0.6f * WProtect);
+            }
+        }
+
+        void UpdateClutch(float dt, bool conscious)
+        {
+            if (!conscious) { clutchTimer = 0f; return; }
+            bool allowed = State == MotorState.Stand || State == MotorState.Lie || State == MotorState.Hop || State == MotorState.Crawl;
+            if (clutchTimer > 0f)
+            {
+                clutchTimer -= dt;
+                if (clutchWound == null || !clutchWound.Active || clutchWound.part == null || !clutchWound.part.attached || clutchHand < 0 || !body.ArmUsable[clutchHand] || !allowed) clutchTimer = 0f;
+                if (clutchTimer <= 0f) clutchCooldown = rng.Range(2f, 5f);
+            }
+            else if (clutchCooldown <= 0f && allowed)
+            {
+                Wound w = body.Wounds.WorstClutchable();
+                if (w != null)
+                {
+                    int hand = PickClutchHand(w);
+                    if (hand >= 0) { clutchWound = w; clutchHand = hand; clutchTimer = rng.Range(3f, 7f); }
+                    else clutchCooldown = 3f;
+                }
+                else clutchCooldown = 1.5f;
+            }
+        }
+
+        int PickClutchHand(Wound w)
+        {
+            if (w.part == null) return -1;
+            PartId id = w.part.id;
+            int arm = PartInfo.ArmSide(id);
+            if (arm == 0) return body.ArmUsable[1] ? 1 : -1;
+            if (arm == 1) return body.ArmUsable[0] ? 0 : -1;
+            if (PartInfo.IsLeg(id) && State == MotorState.Stand && (id == PartId.ShinL || id == PartId.ShinR || PartInfo.IsFoot(id))) return -1;
+            float side = PartInfo.SideSign(id);
+            int pref = side < 0f ? 0 : side > 0f ? 1 : (rng.Value < 0.5f ? 0 : 1);
+            if (body.ArmUsable[pref]) return pref;
+            if (body.ArmUsable[1 - pref]) return 1 - pref;
+            return -1;
+        }
+
+        /// <summary>Arm IK blended with weight w: shoulder/elbow/wrist targets so the hand reaches 'target'.</summary>
+        public void ArmIK(int k, Vector3 target, Vector3 elbowHint, float reach, float stiffness, float w)
+        {
+            if (!body.ArmUsable[k] || w <= 0.001f) return;
             PartId up = k == 0 ? PartId.UpperArmL : PartId.UpperArmR, fore = k == 0 ? PartId.ForearmL : PartId.ForearmR, hand = k == 0 ? PartId.HandL : PartId.HandR;
             var chest = body.Chest;
             var upper = body.Part(up);
+            if (chest == null || upper == null) return;
             float s = body.Scale;
             float l1 = (PartInfo.Origin[(int)fore] - PartInfo.Origin[(int)up]).magnitude * s;
             float l2 = (PartInfo.Origin[(int)hand] - PartInfo.Origin[(int)fore]).magnitude * s + 0.07f * s;
@@ -1875,69 +2355,9 @@ namespace RagdollSandbox
             Quaternion upW = Pose.FromDirs(up, d1, p1);
             Quaternion foreW = Pose.FromDirs(fore, d2, p2);
             var mus = body.Muscles;
-            mus.Set(up, Quaternion.Inverse(chest.rb.rotation) * upW, stiffness);
-            mus.Set(fore, Quaternion.Inverse(upW) * foreW, stiffness);
-            mus.Set(hand, Quaternion.identity, stiffness);
-            ArmOverride[k] = true;
-        }
-
-        void Reactions(float dt)
-        {
-            if (!Sandbox.Boot.general.reactions) return;
-            var mus = body.Muscles;
-            // Shield head after a nearby explosion
-            if (shieldTimer > 0f && State != MotorState.GetUp && State != MotorState.Crawl)
-            {
-                ProtectHead(0); ProtectHead(1);
-                mus.Brace = Mathf.Max(mus.Brace, 0.6f);
-                return;
-            }
-            // Clutch a bleeding wound with a free hand
-            if (State == MotorState.Stand || State == MotorState.Lie || State == MotorState.Hop)
-            {
-                if (clutchTimer > 0f)
-                {
-                    clutchTimer -= dt;
-                    if (clutchWound == null || !clutchWound.Active || clutchWound.part == null || !clutchWound.part.attached || clutchHand < 0 || !body.ArmUsable[clutchHand]) clutchTimer = 0f;
-                    else
-                    {
-                        Vector3 p = clutchWound.WorldPosition + clutchWound.WorldNormal * 0.035f * body.Scale;
-                        float side = clutchHand == 0 ? -1f : 1f;
-                        ArmIK(clutchHand, p, Vector3.down + body.Chest.rb.rotation * (Vector3.right * side) * 0.6f + Vector3.back * 0.3f, 1f, 1f);
-                        if (clutchWound.part != null) clutchWound.part.bloodiness = 1f;
-                        var hp = body.Part(clutchHand == 0 ? PartId.HandL : PartId.HandR);
-                        if (hp != null) hp.bloodiness = 1f;
-                    }
-                    if (clutchTimer <= 0f) clutchCooldown = rng.Range(2f, 5f);
-                }
-                else if (clutchCooldown <= 0f)
-                {
-                    Wound w = body.Wounds.WorstClutchable();
-                    if (w != null)
-                    {
-                        int hand = PickClutchHand(w);
-                        if (hand >= 0) { clutchWound = w; clutchHand = hand; clutchTimer = rng.Range(3f, 7f); }
-                        else clutchCooldown = 3f;
-                    }
-                    else clutchCooldown = 1.5f;
-                }
-            }
-        }
-
-        int PickClutchHand(Wound w)
-        {
-            if (w.part == null) return -1;
-            PartId id = w.part.id;
-            bool leftArmPart = id == PartId.UpperArmL || id == PartId.ForearmL || id == PartId.HandL;
-            bool rightArmPart = id == PartId.UpperArmR || id == PartId.ForearmR || id == PartId.HandR;
-            if (leftArmPart) return body.ArmUsable[1] ? 1 : -1;
-            if (rightArmPart) return body.ArmUsable[0] ? 0 : -1;
-            if (PartInfo.IsLeg(id) && State == MotorState.Stand && (id == PartId.ShinL || id == PartId.ShinR || id == PartId.FootL || id == PartId.FootR)) return -1;
-            float side = PartInfo.SideSign(id);
-            int pref = side < 0f ? 0 : side > 0f ? 1 : (rng.Value < 0.5f ? 0 : 1);
-            if (body.ArmUsable[pref]) return pref;
-            if (body.ArmUsable[1 - pref]) return 1 - pref;
-            return -1;
+            mus.Blend(up, Quaternion.Inverse(chest.rb.rotation) * upW, w, stiffness);
+            mus.Blend(fore, Quaternion.Inverse(upW) * foreW, w, stiffness);
+            mus.Blend(hand, Quaternion.identity, w, stiffness);
         }
 
         void Gaze(float dt)
@@ -1957,20 +2377,21 @@ namespace RagdollSandbox
                 target = Sandbox.MainCamera.transform.position + saccade;
             else target = eye + body.Locomotion.Heading * Vector3.forward * 3f + saccade * 3f;
             GazeTarget = target;
+            if (State == MotorState.Fall || State == MotorState.GetUp) return;
             Quaternion neck, headL;
             IKSolver.LookAt(chest.rb.rotation, eye, target, 70f, 40f, out neck, out headL);
-            if (State == MotorState.Fall || State == MotorState.GetUp) return;
             body.Muscles.Set(PartId.Neck, neck);
             body.Muscles.Set(PartId.Head, headL);
         }
 
         public void OnImpact(BodyPart part, float impulse, Vector3 dir)
         {
-            if (!Sandbox.Boot.general.reactions || body.Vitals.Dead || body.Vitals.Unconscious) return;
+            if (React <= 0f || body.Vitals.Dead || body.Vitals.Unconscious) return;
             var mus = body.Muscles;
             float k = Mathf.Clamp01(impulse / 80f);
             mus.Flinch(k);
             if (impulse > 70f) mus.StunFor(Mathf.Lerp(0.2f, 0.9f, Mathf.Clamp01((impulse - 70f) / 150f)));
+            if (part != null && part.id == PartId.Head && impulse > 25f) holdHeadTimer = Mathf.Max(holdHeadTimer, 2.5f);
             if (painVoiceCooldown <= 0f && impulse > 25f && Sandbox.Audio != null && body.HeadAttached)
             {
                 painVoiceCooldown = rng.Range(0.6f, 1.4f);
@@ -1979,9 +2400,25 @@ namespace RagdollSandbox
             }
         }
 
+        /// <summary>Hit by a vehicle: flail, lose balance, brace for the landing.</summary>
+        public void OnVehicleHit(float speed, Vector3 dir)
+        {
+            if (body.Vitals.Dead) return;
+            flailTimer = Mathf.Clamp(0.4f + speed * 0.12f, 0.6f, 2f);
+            body.Muscles.StunFor(0.25f);
+            body.Vitals.AddAdrenaline(0.5f);
+            if (State == MotorState.Stand || State == MotorState.Hop || State == MotorState.GetUp) SetState(MotorState.Fall);
+            ReleaseGrip(0); ReleaseGrip(1);
+            if (painVoiceCooldown <= 0f && Sandbox.Audio != null && body.Head != null)
+            {
+                painVoiceCooldown = 1f;
+                Sandbox.Audio.PlayVoice(Sfx.Pain1, body.Head.rb.position, 1f, rng.Range(0.95f, 1.1f));
+            }
+        }
+
         public void OnPain(float amount)
         {
-            if (!Sandbox.Boot.general.reactions || body.Vitals.Dead || body.Vitals.Unconscious || !body.HeadAttached) return;
+            if (React <= 0f || body.Vitals.Dead || body.Vitals.Unconscious || !body.HeadAttached) return;
             if (painVoiceCooldown > 0f || Sandbox.Audio == null) return;
             painVoiceCooldown = rng.Range(0.8f, 1.8f);
             Sfx v = amount > 30f ? (rng.Value < 0.5f ? Sfx.Pain0 : Sfx.Pain1) : amount > 12f ? Sfx.Grunt2 : Sfx.Gasp;
@@ -2002,7 +2439,7 @@ namespace RagdollSandbox
             for (int k = 0; k < 2; k++)
             {
                 bool want = k == 0 ? Input.reachL : Input.reachR;
-                if (!want) { ReleaseGrip(k); continue; }
+                if (!want) { if (Grip[k] != null && !IsHanging()) ReleaseGrip(k); continue; }
                 if (!body.ArmUsable[k]) continue;
                 PartId up = k == 0 ? PartId.UpperArmL : PartId.UpperArmR;
                 Vector3 shoulder = body.Part(up).rb.position;
@@ -2010,31 +2447,9 @@ namespace RagdollSandbox
                 Vector3 to = Input.aimPoint - shoulder;
                 Vector3 target = to.magnitude < armLen * 1.15f ? Input.aimPoint : shoulder + MathUtil.SafeNormal(Input.aimDir, to.normalized) * armLen;
                 float side = k == 0 ? -1f : 1f;
-                ArmIK(k, target, Vector3.down + body.Chest.rb.rotation * (Vector3.right * side), 1f, 1.4f);
-                TryGrip(k);
+                ArmIK(k, target, Vector3.down + body.Chest.rb.rotation * (Vector3.right * side), 1f, 1.4f, 1f);
+                TryGrip(k, null);
             }
-        }
-
-        void TryGrip(int k)
-        {
-            if (handGrip[k] != null) return;
-            var hand = body.Part(k == 0 ? PartId.HandL : PartId.HandR);
-            if (hand == null || !hand.attached || !hand.Touching || hand.contactCollider == null) return;
-            BodyPart other = Registry.PartOf(hand.contactCollider);
-            if (other != null && other.body == body) return;
-            var fj = hand.gameObject.AddComponent<FixedJoint>();
-            if (hand.contactBody != null) fj.connectedBody = hand.contactBody;
-            fj.breakForce = 2200f * body.MassScale * Mathf.Clamp01(body.Muscles.ArmStrength(k) + 0.2f);
-            fj.breakTorque = 900f * body.MassScale;
-            fj.enablePreprocessing = false;
-            handGrip[k] = fj;
-            if (Sandbox.Audio != null) Sandbox.Audio.Play(Sfx.Thump, hand.rb.position, 0.25f, 1.3f);
-        }
-
-        void ReleaseGrip(int k)
-        {
-            if (handGrip[k] != null) { UnityEngine.Object.Destroy(handGrip[k]); }
-            handGrip[k] = null;
         }
 
         void Struggle(float dt)
@@ -2042,19 +2457,153 @@ namespace RagdollSandbox
             if (grabbedPart == null || !grabbedPart.attached) { grabbedPart = null; return; }
             var v = body.Vitals;
             if (v.Dead || v.Unconscious || !body.BrainPresent) return;
-            // conscious bodies fight back: reach for the grabbed limb and kick
-            float k = Mathf.Clamp01(v.Consciousness) * Sandbox.Boot.vitals.willToLive;
+            float k = Mathf.Clamp01(v.Consciousness) * Will * React;
             if (k <= 0.05f) return;
             body.Muscles.Brace = Mathf.Max(body.Muscles.Brace, 0.5f);
             int freeArm = PartInfo.IsArm(grabbedPart.id) ? (PartInfo.IsLeft(grabbedPart.id) ? 1 : 0) : (rng.Value < 0.5f ? 0 : 1);
-            if (body.ArmUsable[freeArm] && State != MotorState.Stand) ArmIK(freeArm, grabbedPart.rb.position, Vector3.down, 1f, 1.2f);
+            if (body.ArmUsable[freeArm] && State != MotorState.Stand) ArmIK(freeArm, grabbedPart.rb.position, Vector3.down, 1f, 1.2f, WStruggle);
             if (rng.Value < dt * 3f * k) body.Muscles.Spasm(0.5f * k);
-            if (rng.Value < dt * 4f * k)
+            if (rng.Value < dt * 4f * k && body.Chest != null)
             {
                 Vector3 j = rng.OnUnitSphere() * 6f * k * body.MassScale;
                 BalanceController.PairImpulse(grabbedPart.rb, j, body.Chest.rb);
             }
         }
+        #endregion
+
+        #region Grab and hold
+        bool AnyGrip() { return Grip[0] != null || Grip[1] != null; }
+
+        /// <summary>Hanging = gripping something while the feet don't carry the body.</summary>
+        bool IsHanging()
+        {
+            if (!AnyGrip()) return false;
+            var bal = body.Balance;
+            return bal.SupportCount == 0 && bal.PelvisHeight > bal.StandHeight * 0.45f;
+        }
+
+        /// <summary>When falling or staggering near something graspable (ledge, pole, car, prop), the hands reach for it
+        /// and latch on. Grip strength drains with fatigue and pain; at zero the hand lets go.</summary>
+        void GrabAndHold(float dt)
+        {
+            var bh = Sandbox.Boot.behaviour;
+            float react = React;
+            bool seek = react > 0f && bh.grabAndHold && (State == MotorState.Fall || WStagger > 0.45f || State == MotorState.Hang) && !Possessed;
+            for (int k = 0; k < 2; k++)
+            {
+                // grip stamina
+                if (Grip[k] != null)
+                {
+                    var v = body.Vitals;
+                    float drain = (0.06f + v.Pain * 0.25f + v.Fatigue * 0.15f + (1f - body.Muscles.ArmStrength(k)) * 0.2f) * Mathf.Lerp(1.6f, 0.5f, Will) / Mathf.Max(0.2f, bh.gripStrength);
+                    GripStamina[k] -= drain * dt;
+                    var hand = body.Part(k == 0 ? PartId.HandL : PartId.HandR);
+                    if (GripStamina[k] <= 0f || hand == null || !hand.attached) { ReleaseGrip(k); regripCooldown = 1.5f; }
+                    else Grip[k].breakForce = GripForce(k);
+                }
+                else GripStamina[k] = Mathf.MoveTowards(GripStamina[k], 1f, dt * 0.15f);
+                bool want = seek && body.ArmUsable[k] && (Grip[k] != null || (hasGrabTarget[k] && GripStamina[k] > 0.2f && regripCooldown <= 0f));
+                WGrab[k] = Mathf.MoveTowards(WGrab[k], want ? react : 0f, dt * 5f);
+            }
+            if (!seek) { hasGrabTarget[0] = hasGrabTarget[1] = false; return; }
+            grabSearchTimer -= dt;
+            if (grabSearchTimer <= 0f) { grabSearchTimer = 0.15f; FindGrabTargets(); }
+            for (int k = 0; k < 2; k++)
+            {
+                if (WGrab[k] <= 0.01f) continue;
+                if (Grip[k] != null)
+                {
+                    // hold on: hand stays where it is (the grip joint does the work), arm keeps tension
+                    continue;
+                }
+                if (!hasGrabTarget[k] || grabTargetCol[k] == null) continue;
+                Vector3 target = grabTargetCol[k].transform.TransformPoint(grabTargetLocal[k]);
+                float side = k == 0 ? -1f : 1f;
+                ArmIK(k, target, Vector3.down + body.Chest.rb.rotation * Vector3.right * side, 1f, 1.3f, WGrab[k]);
+                TryGrip(k, grabTargetCol[k]);
+            }
+        }
+
+        float GripForce(int k)
+        {
+            var bh = Sandbox.Boot.behaviour;
+            return bh.gripStrength * 1600f * body.MassScale * Mathf.Clamp01(GripStamina[k] + 0.15f) * Mathf.Clamp01(body.Muscles.ArmStrength(k) + 0.3f);
+        }
+
+        void FindGrabTargets()
+        {
+            var chest = body.Chest;
+            if (chest == null) return;
+            float s = body.Scale;
+            for (int k = 0; k < 2; k++)
+            {
+                hasGrabTarget[k] = false;
+                if (!body.ArmUsable[k] || Grip[k] != null) continue;
+                var upper = body.Part(k == 0 ? PartId.UpperArmL : PartId.UpperArmR);
+                Vector3 shoulder = upper.rb.position;
+                float reach = 0.72f * s;
+                int n = Physics.OverlapSphereNonAlloc(shoulder, reach, grabCandidates, Layers.GrabMask, QueryTriggerInteraction.Ignore);
+                float best = float.MaxValue;
+                for (int i = 0; i < n; i++)
+                {
+                    var c = grabCandidates[i];
+                    if (c == null) continue;
+                    BodyPart bp = Registry.PartOf(c);
+                    if (bp != null && bp.body == body) continue;
+                    var mc = c as MeshCollider;
+                    if (mc != null && !mc.convex) continue;
+                    if (c is TerrainCollider) continue;
+                    Vector3 cp = c.ClosestPoint(shoulder);
+                    Vector3 d = cp - shoulder;
+                    float dist = d.magnitude;
+                    if (dist < 0.08f * s || dist > reach) continue;
+                    // prefer edges above the waist, on the hand's side, against the fall direction
+                    float height = cp.y - body.Pelvis.rb.position.y;
+                    float sideBias = Vector3.Dot(d, chest.rb.rotation * Vector3.right) * (k == 0 ? -1f : 1f);
+                    float score = dist - Mathf.Clamp(height, -0.3f, 0.6f) * 0.6f - sideBias * 0.3f;
+                    if (score < best) { best = score; grabTargetCol[k] = c; grabTargetLocal[k] = c.transform.InverseTransformPoint(cp); hasGrabTarget[k] = true; }
+                }
+            }
+        }
+
+        void TryGrip(int k, Collider preferred)
+        {
+            if (Grip[k] != null) return;
+            var hand = body.Part(k == 0 ? PartId.HandL : PartId.HandR);
+            if (hand == null || !hand.attached || !hand.Touching || hand.contactCollider == null) return;
+            if (preferred != null && hand.contactCollider != preferred) return;
+            BodyPart other = Registry.PartOf(hand.contactCollider);
+            if (other != null && other.body == body) return;
+            var j = hand.gameObject.AddComponent<ConfigurableJoint>();
+            j.autoConfigureConnectedAnchor = false;
+            j.anchor = hand.transform.InverseTransformPoint(hand.contactPoint);
+            Rigidbody target = hand.contactBody;
+            j.connectedBody = target;
+            j.connectedAnchor = target != null ? target.transform.InverseTransformPoint(hand.contactPoint) : hand.contactPoint;
+            j.xMotion = ConfigurableJointMotion.Locked;
+            j.yMotion = ConfigurableJointMotion.Locked;
+            j.zMotion = ConfigurableJointMotion.Locked;
+            j.angularXMotion = ConfigurableJointMotion.Limited;
+            j.angularYMotion = ConfigurableJointMotion.Limited;
+            j.angularZMotion = ConfigurableJointMotion.Limited;
+            j.lowAngularXLimit = new SoftJointLimit { limit = -50f };
+            j.highAngularXLimit = new SoftJointLimit { limit = 50f };
+            j.angularYLimit = new SoftJointLimit { limit = 50f };
+            j.angularZLimit = new SoftJointLimit { limit = 50f };
+            j.enablePreprocessing = false;
+            j.breakForce = GripForce(k);
+            j.breakTorque = j.breakForce * 0.4f;
+            Grip[k] = j;
+            if (Sandbox.Audio != null) Sandbox.Audio.Play(Sfx.Thump, hand.rb.position, 0.25f, 1.3f);
+        }
+
+        public void ReleaseGrip(int k)
+        {
+            if (Grip[k] != null) UnityEngine.Object.Destroy(Grip[k]);
+            Grip[k] = null;
+        }
+
+        public void ReleaseAllGrips() { ReleaseGrip(0); ReleaseGrip(1); }
         #endregion
     }
     #endregion

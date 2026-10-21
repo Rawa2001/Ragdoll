@@ -31,14 +31,11 @@ namespace RagdollSandbox
             root.SetParent(parent, false);
             int max = Mathf.Max(500, maxParticles);
 
-            BloodDrops = MakeSystem("BloodDrops", MaterialFactory.Blood, max, true, 1f, ParticleSystemRenderMode.Stretch);
+            // blood droplets are simulated by BloodSystem (no particle collision); this system only renders them
+            BloodDrops = MakeSystem("BloodDrops", MaterialFactory.Blood, Mathf.Max(64, Sandbox.Boot.blood.maxDroplets), false, 0f, ParticleSystemRenderMode.Stretch);
             var br = BloodDrops.GetComponent<ParticleSystemRenderer>();
-            br.velocityScale = 0.035f;
+            br.velocityScale = 0.03f;
             br.lengthScale = 1f;
-            var col = BloodDrops.collision;
-            col.dampen = 1f; col.bounce = 0f; col.lifetimeLoss = 1f; col.sendCollisionMessages = true; col.radiusScale = 0.4f;
-            col.quality = ParticleSystemCollisionQuality.High;
-            BloodDrops.gameObject.AddComponent<BloodCollisionHandler>();
 
             BloodMist = MakeSystem("BloodMist", MaterialFactory.Mist, max / 3, false, 0.15f, ParticleSystemRenderMode.Billboard);
             SetSizeOverLife(BloodMist, 0.6f, 2.2f);
@@ -244,24 +241,26 @@ namespace RagdollSandbox
 
         public void EmitBloodDrop(Vector3 pos, Vector3 vel, float size, Color color)
         {
-            Emit(BloodDrops, pos, vel, size, rng.Range(1.5f, 3f), color);
+            if (Sandbox.Blood != null) Sandbox.Blood.Drop(pos, vel, size, color);
         }
 
         public void EmitBloodSpray(Vector3 pos, Vector3 dir, float speed, float spreadDeg, int count, float size, Color color, Vector3 inherit)
         {
-            int n = Count(count * Mathf.Max(0.2f, Sandbox.BloodAmount));
-            if (Sandbox.BloodAmount <= 0.001f) return;
+            if (Sandbox.BloodAmount <= 0.001f || Sandbox.Blood == null) return;
+            int n = Mathf.RoundToInt(count * Mathf.Max(0.2f, Sandbox.BloodAmount) * Budget * Sandbox.Blood.SpawnScale(pos));
+            dir = MathUtil.SafeNormal(dir, Vector3.up);
             for (int i = 0; i < n; i++)
             {
                 Vector3 d = Quaternion.AngleAxis(rng.Range(0f, 360f), dir) * Quaternion.AngleAxis(rng.Range(0f, spreadDeg), Perp(dir)) * dir;
-                Emit(BloodDrops, pos, inherit + d * speed * rng.Range(0.5f, 1.1f), size * rng.Range(0.5f, 1.3f), rng.Range(1.5f, 3f), color);
+                Sandbox.Blood.Drop(pos, inherit + d * speed * rng.Range(0.5f, 1.1f), size * rng.Range(0.5f, 1.3f), color, false);
             }
         }
 
         public void EmitMist(Vector3 pos, Vector3 vel, int count, float size, Color color)
         {
             if (Sandbox.BloodAmount <= 0.001f) return;
-            int n = Count(count);
+            if (Sandbox.Blood != null && Sandbox.Blood.ClayMode) return;
+            int n = Mathf.RoundToInt(count * Budget * (Sandbox.Blood != null ? Sandbox.Blood.SpawnScale(pos) : 1f));
             for (int i = 0; i < n; i++)
                 Emit(BloodMist, pos + rng.OnUnitSphere() * size * 0.3f, vel + rng.OnUnitSphere() * 0.6f, size * rng.Range(0.6f, 1.4f), rng.Range(0.6f, 1.4f), color);
         }
@@ -428,11 +427,14 @@ namespace RagdollSandbox
     #region DecalSystem
     public enum DecalKind { Blood, Scorch, BulletHole, Footprint, Handprint, Smear, Crack }
 
-    /// <summary>Decals on static geometry are batched into chunked meshes (one draw call per chunk) with a global cap
-    /// that recycles the oldest; decals on moving bodies use a small pool of parented quads.</summary>
+    /// <summary>All decals live in one ring buffer. Static decals are batched into chunked meshes (one draw call per
+    /// chunk, rebuilt only when a decal in the chunk changes, frustum-culled by computed bounds). Decals on moving
+    /// bodies are stored relative to their body and rendered through one dynamic mesh rebuilt each frame.
+    /// No GameObject per decal; the global cap recycles the oldest.</summary>
     public class DecalSystem
     {
         const int ChunkSize = 256;
+        const int DynCap = 128;
 
         class Chunk
         {
@@ -441,6 +443,7 @@ namespace RagdollSandbox
             public Vector2[] uv;
             public Color32[] c;
             public bool geomDirty, colorDirty;
+            public MeshRenderer mr;
         }
 
         struct Rec
@@ -452,23 +455,31 @@ namespace RagdollSandbox
             public float baseAlpha;
         }
 
+        struct Dyn
+        {
+            public bool alive;
+            public Transform t;
+            public Vector3 l0, l1, l2, l3;
+            public Color baseColor;
+            public float birth;
+        }
+
         Chunk[] chunks;
         Rec[] recs;
         int capacity, allocated, next;
         float ageTimer;
         Transform root;
-
-        // Dynamic (parented) decals
-        class DynDecal { public GameObject go; public Transform t; public Mesh mesh; public Color32[] colors; public float birth; public Color baseColor; public bool alive; }
-        DynDecal[] dyn;
+        // dynamic decals: one mesh
+        Dyn[] dyn;
         int nextDyn;
-        static readonly Vector3[] quadTmp = new Vector3[4];
-        static readonly Vector2[] uvTmp = new Vector2[4];
+        Mesh dynMesh;
+        Vector3[] dynV;
+        Vector2[] dynUV;
+        Color32[] dynC;
+        int liveCount, liveDyn;
 
-        public int Count
-        {
-            get { int n = 0; for (int i = 0; i < capacity; i++) if (recs[i].alive) n++; return n; }
-        }
+        public int Count { get { return liveCount + liveDyn; } }
+        public int Capacity { get { return capacity; } }
 
         public void Build(Transform parent, int max)
         {
@@ -480,19 +491,19 @@ namespace RagdollSandbox
             recs = new Rec[allocated];
             int nChunks = allocated / ChunkSize;
             chunks = new Chunk[nChunks];
+            var tris = new int[ChunkSize * 6];
+            for (int q = 0; q < ChunkSize; q++)
+            {
+                int vi = q * 4, ti = q * 6;
+                tris[ti] = vi; tris[ti + 1] = vi + 1; tris[ti + 2] = vi + 2;
+                tris[ti + 3] = vi; tris[ti + 4] = vi + 2; tris[ti + 5] = vi + 3;
+            }
             for (int ci = 0; ci < nChunks; ci++)
             {
                 var ch = new Chunk();
                 ch.v = new Vector3[ChunkSize * 4];
                 ch.uv = new Vector2[ChunkSize * 4];
                 ch.c = new Color32[ChunkSize * 4];
-                var tris = new int[ChunkSize * 6];
-                for (int q = 0; q < ChunkSize; q++)
-                {
-                    int vi = q * 4, ti = q * 6;
-                    tris[ti] = vi; tris[ti + 1] = vi + 1; tris[ti + 2] = vi + 2;
-                    tris[ti + 3] = vi; tris[ti + 4] = vi + 2; tris[ti + 5] = vi + 3;
-                }
                 ch.mesh = new Mesh();
                 ch.mesh.name = "DecalChunk" + ci;
                 ch.mesh.MarkDynamic();
@@ -500,18 +511,42 @@ namespace RagdollSandbox
                 ch.mesh.uv = ch.uv;
                 ch.mesh.colors32 = ch.c;
                 ch.mesh.triangles = tris;
-                ch.mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 4000f);
+                ch.mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 0.01f);
                 var go = new GameObject("DecalChunk" + ci);
                 go.transform.SetParent(root, false);
                 go.AddComponent<MeshFilter>().sharedMesh = ch.mesh;
-                var mr = go.AddComponent<MeshRenderer>();
-                mr.sharedMaterial = MaterialFactory.Decal;
-                mr.shadowCastingMode = ShadowCastingMode.Off;
-                mr.receiveShadows = false;
+                ch.mr = go.AddComponent<MeshRenderer>();
+                ch.mr.sharedMaterial = MaterialFactory.Decal;
+                ch.mr.shadowCastingMode = ShadowCastingMode.Off;
+                ch.mr.receiveShadows = false;
+                ch.mr.enabled = false;
                 chunks[ci] = ch;
             }
-            dyn = new DynDecal[160];
-            for (int i = 0; i < dyn.Length; i++) dyn[i] = MakeDyn(i);
+            dyn = new Dyn[DynCap];
+            dynV = new Vector3[DynCap * 4];
+            dynUV = new Vector2[DynCap * 4];
+            dynC = new Color32[DynCap * 4];
+            var dtris = new int[DynCap * 6];
+            for (int q = 0; q < DynCap; q++)
+            {
+                int vi = q * 4, ti = q * 6;
+                dtris[ti] = vi; dtris[ti + 1] = vi + 1; dtris[ti + 2] = vi + 2;
+                dtris[ti + 3] = vi; dtris[ti + 4] = vi + 2; dtris[ti + 5] = vi + 3;
+            }
+            dynMesh = new Mesh();
+            dynMesh.name = "DynamicDecals";
+            dynMesh.MarkDynamic();
+            dynMesh.vertices = dynV;
+            dynMesh.uv = dynUV;
+            dynMesh.colors32 = dynC;
+            dynMesh.triangles = dtris;
+            var dgo = new GameObject("DynamicDecals");
+            dgo.transform.SetParent(root, false);
+            dgo.AddComponent<MeshFilter>().sharedMesh = dynMesh;
+            var dmr = dgo.AddComponent<MeshRenderer>();
+            dmr.sharedMaterial = MaterialFactory.Decal;
+            dmr.shadowCastingMode = ShadowCastingMode.Off;
+            dmr.receiveShadows = false;
         }
 
         public void SetCapacity(int n)
@@ -530,6 +565,7 @@ namespace RagdollSandbox
         {
             if (!recs[i].alive) return;
             recs[i].alive = false;
+            liveCount--;
             var ch = chunks[i / ChunkSize];
             int vi = (i % ChunkSize) * 4;
             for (int k = 0; k < 4; k++) { ch.v[vi + k] = Vector3.zero; ch.c[vi + k] = new Color32(0, 0, 0, 0); }
@@ -539,11 +575,8 @@ namespace RagdollSandbox
         public void Clear()
         {
             for (int i = 0; i < allocated; i++) Kill(i);
-            for (int i = 0; i < dyn.Length; i++)
-            {
-                if (dyn[i].go == null) { dyn[i] = MakeDyn(i); continue; }
-                dyn[i].alive = false; dyn[i].go.SetActive(false); dyn[i].t.SetParent(root, false);
-            }
+            for (int i = 0; i < dyn.Length; i++) dyn[i].alive = false;
+            liveDyn = 0;
             next = 0;
         }
 
@@ -560,11 +593,12 @@ namespace RagdollSandbox
             float hw = size * 0.5f * stretch, hh = size * 0.5f;
             if (attach != null)
             {
-                AddDynamic(pos, normal, t, bt, hw, hh, uv, color, attach);
+                AddDynamic(pos + normal * 0.005f, t, bt, hw, hh, uv, color, attach);
                 return;
             }
             int i = next;
             next = (next + 1) % capacity;
+            if (!recs[i].alive) liveCount++;
             var ch = chunks[i / ChunkSize];
             int vi = (i % ChunkSize) * 4;
             float offset = 0.004f + (i % 7) * 0.0009f;
@@ -587,70 +621,36 @@ namespace RagdollSandbox
             recs[i].baseAlpha = color.a;
         }
 
-        DynDecal MakeDyn(int i)
+        void AddDynamic(Vector3 c, Vector3 t, Vector3 bt, float hw, float hh, Rect uv, Color color, Transform attach)
         {
-            var d = new DynDecal();
-            d.go = new GameObject("DynDecal" + i);
-            d.t = d.go.transform;
-            d.t.SetParent(root, false);
-            d.mesh = new Mesh();
-            d.mesh.name = "DynDecal";
-            d.mesh.MarkDynamic();
-            d.mesh.vertices = new Vector3[4];
-            d.mesh.uv = new Vector2[4];
-            d.colors = new Color32[4];
-            d.mesh.colors32 = d.colors;
-            d.mesh.triangles = new[] { 0, 1, 2, 0, 2, 3 };
-            d.go.AddComponent<MeshFilter>().sharedMesh = d.mesh;
-            var mr = d.go.AddComponent<MeshRenderer>();
-            mr.sharedMaterial = MaterialFactory.Decal;
-            mr.shadowCastingMode = ShadowCastingMode.Off;
-            mr.receiveShadows = false;
-            d.go.SetActive(false);
-            return d;
-        }
-
-        void AddDynamic(Vector3 pos, Vector3 normal, Vector3 t, Vector3 bt, float hw, float hh, Rect uv, Color color, Transform attach)
-        {
-            if (dyn[nextDyn].go == null) dyn[nextDyn] = MakeDyn(nextDyn);
-            var d = dyn[nextDyn];
-            nextDyn = (nextDyn + 1) % dyn.Length;
-            d.t.SetParent(attach, false);
-            d.t.position = pos + normal * 0.005f;
-            d.t.rotation = Quaternion.LookRotation(t, normal);
-            // local quad: x = bitangent, z = tangent (LookRotation forward = t, up = normal)
-            Vector3 s = d.t.lossyScale;
-            float sx = Mathf.Abs(s.x) > 1e-4f ? 1f / s.x : 1f, sz = Mathf.Abs(s.z) > 1e-4f ? 1f / s.z : 1f;
-            quadTmp[0] = new Vector3(-hh * sx, 0f, -hw * sz);
-            quadTmp[1] = new Vector3(-hh * sx, 0f, hw * sz);
-            quadTmp[2] = new Vector3(hh * sx, 0f, hw * sz);
-            quadTmp[3] = new Vector3(hh * sx, 0f, -hw * sz);
-            uvTmp[0] = new Vector2(uv.xMin, uv.yMin); uvTmp[1] = new Vector2(uv.xMax, uv.yMin);
-            uvTmp[2] = new Vector2(uv.xMax, uv.yMax); uvTmp[3] = new Vector2(uv.xMin, uv.yMax);
-            d.mesh.vertices = quadTmp;
-            d.mesh.uv = uvTmp;
+            int i = nextDyn;
+            nextDyn = (nextDyn + 1) % DynCap;
+            if (!dyn[i].alive) liveDyn++;
+            dyn[i].alive = true;
+            dyn[i].t = attach;
+            dyn[i].l0 = attach.InverseTransformPoint(c - t * hw - bt * hh);
+            dyn[i].l1 = attach.InverseTransformPoint(c + t * hw - bt * hh);
+            dyn[i].l2 = attach.InverseTransformPoint(c + t * hw + bt * hh);
+            dyn[i].l3 = attach.InverseTransformPoint(c - t * hw + bt * hh);
+            dyn[i].baseColor = color;
+            dyn[i].birth = Time.time;
+            int vi = i * 4;
+            dynUV[vi] = new Vector2(uv.xMin, uv.yMin);
+            dynUV[vi + 1] = new Vector2(uv.xMax, uv.yMin);
+            dynUV[vi + 2] = new Vector2(uv.xMax, uv.yMax);
+            dynUV[vi + 3] = new Vector2(uv.xMin, uv.yMax);
+            dynMesh.uv = dynUV;
             Color32 c32 = color;
-            for (int k = 0; k < 4; k++) d.colors[k] = c32;
-            d.mesh.colors32 = d.colors;
-            d.mesh.RecalculateBounds();
-            d.baseColor = color;
-            d.birth = Time.time;
-            d.alive = true;
-            d.go.SetActive(true);
+            for (int k = 0; k < 4; k++) dynC[vi + k] = c32;
         }
 
-        /// <summary>Releases parented decals when their body is destroyed.</summary>
+        /// <summary>Releases decals attached to a transform that is being destroyed.</summary>
         public void DetachFrom(Transform t)
         {
             for (int i = 0; i < dyn.Length; i++)
             {
-                if (!dyn[i].alive || dyn[i].go == null) continue;
-                if (dyn[i].t.parent == t || dyn[i].t.IsChildOf(t))
-                {
-                    dyn[i].alive = false;
-                    dyn[i].go.SetActive(false);
-                    dyn[i].t.SetParent(root, false);
-                }
+                if (!dyn[i].alive) continue;
+                if (dyn[i].t == null || dyn[i].t == t || dyn[i].t.IsChildOf(t)) { dyn[i].alive = false; liveDyn--; }
             }
         }
 
@@ -680,16 +680,12 @@ namespace RagdollSandbox
             }
             for (int i = 0; i < dyn.Length; i++)
             {
-                var d = dyn[i];
-                if (!d.alive) continue;
-                if (d.go == null) { dyn[i] = MakeDyn(i); continue; }
-                if (d.t.parent == null || !d.t.parent.gameObject.activeInHierarchy) { d.alive = false; d.go.SetActive(false); d.t.SetParent(root, false); continue; }
-                float age = now - d.birth;
+                if (!dyn[i].alive) continue;
+                float age = now - dyn[i].birth;
                 if (age > bs.decalDryTime * 1.3f) continue;
-                Color c = Color.Lerp(d.baseColor, bs.dried, Mathf.Clamp01(age / bs.decalDryTime) * 0.85f);
+                Color c = Color.Lerp(dyn[i].baseColor, bs.dried, Mathf.Clamp01(age / bs.decalDryTime) * 0.85f);
                 Color32 c32 = c;
-                for (int k = 0; k < 4; k++) d.colors[k] = c32;
-                d.mesh.colors32 = d.colors;
+                for (int k = 0; k < 4; k++) dynC[i * 4 + k] = c32;
             }
         }
 
@@ -704,7 +700,19 @@ namespace RagdollSandbox
                     ch.mesh.vertices = ch.v;
                     ch.mesh.uv = ch.uv;
                     ch.geomDirty = false;
-                    ch.mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 4000f);
+                    // tight bounds so far / off-screen chunks are culled
+                    Vector3 mn = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue), mx = -mn;
+                    bool any = false;
+                    for (int k = 0; k < ch.v.Length; k += 4)
+                    {
+                        Vector3 a = ch.v[k];
+                        if (a == Vector3.zero && ch.v[k + 2] == Vector3.zero) continue;
+                        any = true;
+                        mn = Vector3.Min(mn, Vector3.Min(a, ch.v[k + 2])); mx = Vector3.Max(mx, Vector3.Max(a, ch.v[k + 2]));
+                        mn = Vector3.Min(mn, Vector3.Min(ch.v[k + 1], ch.v[k + 3])); mx = Vector3.Max(mx, Vector3.Max(ch.v[k + 1], ch.v[k + 3]));
+                    }
+                    ch.mr.enabled = any;
+                    if (any) ch.mesh.bounds = new Bounds((mn + mx) * 0.5f, mx - mn + Vector3.one * 0.05f);
                 }
                 if (ch.colorDirty)
                 {
@@ -712,7 +720,28 @@ namespace RagdollSandbox
                     ch.colorDirty = false;
                 }
             }
+            // dynamic decals follow their bodies
+            if (liveDyn > 0 || dynWasLive)
+            {
+                for (int i = 0; i < dyn.Length; i++)
+                {
+                    int vi = i * 4;
+                    var d = dyn[i];
+                    if (d.alive && (d.t == null || !d.t.gameObject.activeInHierarchy)) { dyn[i].alive = false; liveDyn--; d.alive = false; }
+                    if (!d.alive) { dynV[vi] = dynV[vi + 1] = dynV[vi + 2] = dynV[vi + 3] = Vector3.zero; continue; }
+                    dynV[vi] = d.t.TransformPoint(d.l0);
+                    dynV[vi + 1] = d.t.TransformPoint(d.l1);
+                    dynV[vi + 2] = d.t.TransformPoint(d.l2);
+                    dynV[vi + 3] = d.t.TransformPoint(d.l3);
+                }
+                dynMesh.vertices = dynV;
+                dynMesh.colors32 = dynC;
+                dynMesh.bounds = new Bounds(Vector3.zero, Vector3.one * 4000f);
+                dynWasLive = liveDyn > 0;
+            }
         }
+
+        bool dynWasLive;
     }
     #endregion
 }
